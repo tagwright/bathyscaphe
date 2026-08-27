@@ -90,6 +90,15 @@ impl Resolver {
     pub fn new(cgroups: Arc<CgroupMap>, enrichment: Arc<EnrichmentCache>) -> Self {
         Self { cgroups, enrichment }
     }
+
+    /// A snapshot of every container-shaped cgroup discovered so far:
+    /// `(container_id, cgroup_id, cgroup_path)`. See
+    /// [`super::cgroup::CgroupMap::snapshot`] -- this is the one caller
+    /// outside `attribution` that needs it, the CLI build chunk's
+    /// standalone `observe` mode.
+    pub fn known_containers(&self) -> Vec<(String, u64, PathBuf)> {
+        self.cgroups.snapshot()
+    }
 }
 
 impl Attributor for Resolver {

@@ -10,6 +10,10 @@ bathyscaphe-proto = { path = "../bathyscaphe-proto" }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 libc = { workspace = true }
+# The CLI surface (`run` / `unpin --all` / `observe` / `version`). Only this
+# crate's binary needs it, so it is not promoted to [workspace.dependencies],
+# matching the convention `regex`/`inotify`/`bollard` already follow below.
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 # Trailing-cgroup-path-segment parsing (attribution::cgroup). Only this crate
 # needs it, so it is not promoted to [workspace.dependencies].
 regex = { version = "1", default-features = false, features = ["std", "perf"] }

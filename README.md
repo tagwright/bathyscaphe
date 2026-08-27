@@ -1,10 +1,12 @@
 # bathyscaphe
 
-Status: early scaffold, under construction. The workspace builds, one
-trivial eBPF program compiles and links, and that's it. No policy, no
-loader, no attribution. See docs/BUILDING.md for the toolchain that makes
-the eBPF side compile at all, since that's the part most likely to need
-touching before anything else here is useful.
+Status: under construction, past scaffold. The workspace builds, the
+eBPF programs load and pin, policy compilation and reconciliation work,
+and the CLI (`run` / `unpin --all` / `observe` / `version`) is wired up.
+Not yet built: the DNS-snoop FQDN layer and the packaged Dockerfile. See
+docs/BUILDING.md for the toolchain that makes the eBPF side compile at
+all, since that's the part most likely to need touching before anything
+else here is useful.
 
 A bathyscaphe is a crewed deep-sea submersible: a small pressure-hulled
 vehicle that descends into the deep ocean under its own ballast, with
@@ -74,6 +76,39 @@ Loud accounting is the other half of this: anything security-relevant
 violation, an enforced block) gets emitted as a structured record, not
 buried in a log line, so airlock and beacon can act on it without
 scraping text.
+
+## Usage
+
+Four subcommands:
+
+- `bathyscaphe run` -- the real thing: an airlock-driven subprocess.
+  NDJSON events/stats/acks on stdout, directives on stdin, human-ish logs
+  on stderr. This is the fail-closed-persistent mode described above.
+  Flags: `--bpffs-root`, `--cgroup-root`, and the R2 knobs
+  (`--fail-closed-on-drops`, `--drop-threshold-per-sec`,
+  `--drop-window-secs`, `--drop-action`).
+- `bathyscaphe unpin --all` -- the break-glass. Works standalone, with no
+  running probe and no airlock: clears every pinned program, map, and
+  per-container link under `--bpffs-root` and prints what it removed.
+  `--all` is required on purpose; a bare `unpin` refuses to guess scope.
+- `bathyscaphe observe` -- a standalone, observe-only mode for manual
+  verification: no airlock, no policy, no enforcement. It attaches to
+  whatever containers are already running (and picks up new ones), prints
+  egress events to stdout (`--format json|text`, optionally filtered with
+  `--container`), and on Ctrl-C detaches everything it attached. If it did
+  the initial load itself (the common case: nothing else has this
+  bpffs-root pinned), it also removes its own pin subtree on exit, so it
+  leaves no trace. This is the opposite of `run`'s persistence, on
+  purpose -- see the CLI's own `--help` for the exact scope this draws
+  when a `run` daemon is already using the same `--bpffs-root`.
+- `bathyscaphe version` -- prints the version, backend name, protocol
+  versions, and capabilities.
+
+`--log-format json|text` (default `json`) and `--log-level` are global
+flags controlling bathyscaphe's own operational logs on stderr, not the
+NDJSON protocol on stdout/stdin (which has its own fixed framing
+regardless). `json` is OpenTelemetry-log-data-model shaped, so bilgeline
+can ingest it with a stock filelog parser with no bespoke config.
 
 ## Requirements
 

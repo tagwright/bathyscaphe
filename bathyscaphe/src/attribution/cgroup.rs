@@ -144,6 +144,21 @@ impl CgroupMap {
         self.inner.lock().unwrap_or_else(|poison| poison.into_inner()).by_container_id.get(container_id).map(|(_, path)| path.clone())
     }
 
+    /// A snapshot of every container-shaped cgroup discovered so far:
+    /// `(container_id, cgroup_id, cgroup_path)`. For the CLI build chunk's
+    /// standalone `observe` mode, which needs to enumerate and attach to
+    /// every currently-running container up front, then diff against this
+    /// same snapshot on a poll interval to pick up ones that started since
+    /// (`bathy_build_spec.md`'s CLI brief: "attach to currently-running
+    /// containers ... and watch for new ones"). Nothing else in this crate
+    /// needs a full listing -- the daemon's directive path always looks up
+    /// one container id at a time -- so this stays a small, explicit
+    /// addition rather than a general-purpose iterator API.
+    pub fn snapshot(&self) -> Vec<(String, u64, PathBuf)> {
+        let inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        inner.by_container_id.iter().map(|(container_id, (cgroup_id, path))| (container_id.clone(), *cgroup_id, path.clone())).collect()
+    }
+
     /// The short-lived-container race fallback (`bathy_attribution.md`
     /// section 4, edge case 1): a targeted, synchronous full walk of
     /// `/sys/fs/cgroup` looking for the one directory whose inode matches
@@ -553,5 +568,26 @@ mod tests {
         let map = CgroupMap::new("/sys/fs/cgroup");
         assert_eq!(map.cgroup_id_for_container(&hex(0x99)), None);
         assert_eq!(map.cgroup_path_for_container(&hex(0x99)), None);
+    }
+
+    #[test]
+    fn snapshot_lists_every_discovered_container_once() {
+        let map = CgroupMap::new("/sys/fs/cgroup");
+        let a = hex(0xaa);
+        let b = hex(0xbb);
+        let path_a = Path::new("/sys/fs/cgroup/system.slice").join(format!("docker-{a}.scope"));
+        let path_b = Path::new("/sys/fs/cgroup/system.slice").join(format!("docker-{b}.scope"));
+        map.observe_path(&path_a, 1).expect("a valid docker scope path should classify");
+        map.observe_path(&path_b, 2).expect("a valid docker scope path should classify");
+
+        let mut snapshot = map.snapshot();
+        snapshot.sort_by(|x, y| x.1.cmp(&y.1));
+        assert_eq!(snapshot, vec![(a, 1, path_a), (b, 2, path_b)]);
+    }
+
+    #[test]
+    fn snapshot_is_empty_for_a_fresh_map() {
+        let map = CgroupMap::new("/sys/fs/cgroup");
+        assert!(map.snapshot().is_empty());
     }
 }
