@@ -21,6 +21,19 @@
 #[allow(dead_code, unused_imports)]
 mod probe;
 
+// CONTAINER ATTRIBUTION + EVENT PIPELINE build chunk: cgroup_id ->
+// container attribution (attribution) and the kernel-Event -> wire-Event
+// mapping that plugs into probe::events::EventConsumer (pipeline). Neither
+// is wired into `main()` yet -- that is the DAEMON build chunk's job (the
+// full protocol loop, `hello`/`start`, and the CLI that actually runs a
+// probe). Both modules are fully exercised by their own unit tests
+// (`cargo test`), which is what proves them out at this stage; see each
+// module's doc and docs/TESTING.md.
+#[allow(dead_code, unused_imports)]
+mod attribution;
+#[allow(dead_code, unused_imports)]
+mod pipeline;
+
 const VERSION: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../VERSION"));
 
 /// The compiled eBPF object for bathyscaphe-ebpf's `connect4` program,

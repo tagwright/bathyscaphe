@@ -10,12 +10,40 @@ bathyscaphe-proto = { path = "../bathyscaphe-proto" }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 libc = { workspace = true }
+# Trailing-cgroup-path-segment parsing (attribution::cgroup). Only this crate
+# needs it, so it is not promoted to [workspace.dependencies].
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# Recursive /sys/fs/cgroup watch (attribution::cgroup): add on mkdir, remove
+# on rmdir. Linux-only, matching the rest of this crate's platform scope.
+inotify = { version = "0.11", default-features = false }
+# id -> name/image enrichment over the Docker/Podman socket
+# (attribution::enrich). Default features are already TLS-free (http, pipe,
+# hyper-util, hyper-named-pipe, hyperlocal) -- no rustls/openssl pulled in
+# for a plain unix-socket connection.
+bollard = "0.21"
+# bollard is async/hyper-based; the rest of this crate is plain OS threads
+# (see probe::events's module doc). Rather than pull tokio into the whole
+# binary, attribution::enrich confines it to one dedicated background
+# thread running a `current_thread` runtime -- see that module's doc.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# RFC3339 wire timestamps (pipeline::map), converted from the kernel's
+# CLOCK_BOOTTIME `ktime_ns` via a wall-clock offset sampled once at start.
+time = { version = "0.3", default-features = false, features = ["formatting"] }
 
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 bathyscaphe-ebpf = { path = "../bathyscaphe-ebpf" }
+
+[dev-dependencies]
+# Parsing the Docker Engine API's JSON response in
+# attribution::resolver::live_smoke's raw setup/teardown client -- proving
+# the resolver against a real container, not exercising a JSON library, so
+# this stays a dev-only dependency rather than something the shipped binary
+# needs.
+serde_json = { workspace = true }
 
 [[bin]]
 name = "bathyscaphe"
