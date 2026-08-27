@@ -96,8 +96,9 @@ use bathyscaphe_proto::down::DownMessage;
 use bathyscaphe_proto::UpMessage;
 
 use crate::attribution::{Attributor, AttributionService};
+use crate::dns::DomainCache;
 use crate::pipeline::{EventSink, Pipeline};
-use crate::probe::{EventConsumer, Probe};
+use crate::probe::{DnsCaptureConsumer, EventConsumer, Probe};
 
 use probe_api::ProbeApi;
 pub use r2::DropEscalationConfig;
@@ -185,6 +186,7 @@ impl Daemon {
         let hello = hello::build_hello(&probe as &dyn ProbeApi, |cgroup_id| resolver.resolve(cgroup_id).map(|a| a.container_id), &config.backend_version);
 
         let ring = probe.take_events().context("the probe's ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)")?;
+        let dns_ring = probe.take_dns_events().context("the probe's DNS ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)")?;
         let boot_offset_ns = sample_boot_offset_ns()?;
 
         let (tx, rx) = mpsc::channel::<UpMessage>();
@@ -215,10 +217,12 @@ impl Daemon {
         let shared_probe = Arc::new(Mutex::new(probe));
         let shared_state = Arc::new(Mutex::new(DaemonState::new()));
         let security = Arc::new(SecurityEmitter::new());
+        let domain_cache = Arc::new(Mutex::new(DomainCache::new()));
 
         let (counting_sink, events_emitted, denies_since_last) = stats::CountingSink::new(tx.clone());
-        let pipeline = Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), counting_sink).context("failed to construct the event pipeline")?;
+        let pipeline = Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), counting_sink).context("failed to construct the event pipeline")?;
         let consumer = EventConsumer::spawn(ring, pipeline.into_callback());
+        let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache)));
 
         let stats_shutdown = Arc::new(AtomicBool::new(false));
         let stats_handle = spawn_stats_thread(Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&security), tx.clone(), Arc::clone(&stats_shutdown), events_emitted, denies_since_last, config.r2, stats_interval_s);
@@ -230,6 +234,7 @@ impl Daemon {
         stats_shutdown.store(true, Ordering::Relaxed);
         let _ = stats_handle.join();
         consumer.stop();
+        dns_consumer.stop();
         attribution.stop();
         drop(tx);
         let _ = stdout_handle.join();

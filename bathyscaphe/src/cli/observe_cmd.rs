@@ -52,9 +52,10 @@ use std::time::Duration;
 use bathyscaphe_proto::UpMessage;
 
 use crate::attribution::{AttributionService, Attributor, Resolver};
+use crate::dns::DomainCache;
 use crate::pipeline::{EventSink, Pipeline};
 use crate::probe::layout::{PinPaths, PinState, pin_state};
-use crate::probe::{EventConsumer, Probe};
+use crate::probe::{DnsCaptureConsumer, EventConsumer, Probe};
 
 use super::log::Logger;
 use super::{ObserveArgs, ObserveFormat};
@@ -135,10 +136,19 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let dns_ring = match probe.take_dns_events() {
+        Some(ring) => ring,
+        None => {
+            logger.error("cli.observe.no_dns_ring", "the probe's DNS ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)");
+            attribution.stop();
+            return ExitCode::from(1);
+        }
+    };
 
     let shared_probe = Arc::new(Mutex::new(probe));
+    let domain_cache = Arc::new(Mutex::new(DomainCache::new()));
     let sink = ObservePrinter { format: args.format, container_filter: args.container.clone() };
-    let pipeline = match Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), sink) {
+    let pipeline = match Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), sink) {
         Ok(pipeline) => pipeline,
         Err(error) => {
             logger.error("cli.observe.pipeline_failed", &format!("{error:#}"));
@@ -147,6 +157,11 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
         }
     };
     let consumer = EventConsumer::spawn(ring, pipeline.into_callback());
+    // Standalone `observe` learns domain names the same way `run` does
+    // (build chunk #9): its own DNS ring-buffer consumer feeding its own,
+    // session-local `DomainCache` -- torn down with everything else on
+    // exit, since this whole mode is ephemeral (see this module's doc).
+    let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache)));
 
     logger.info("cli.observe.watching", "watching for egress events; Ctrl-C to detach and exit");
     while !STOP.load(Ordering::SeqCst) {
@@ -159,6 +174,7 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
 
     logger.info("cli.observe.stopping", "Ctrl-C received; detaching this session's containers and exiting");
     consumer.stop();
+    dns_consumer.stop();
     attribution.stop();
 
     {

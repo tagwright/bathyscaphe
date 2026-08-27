@@ -42,6 +42,12 @@ time = { version = "0.3", default-features = false, features = ["formatting", "p
 # and stats/hello construction need to build serde_json::Value directly,
 # not just parse Docker API responses in a dev-only test.
 serde_json = { workspace = true }
+# DNS response parsing (dns::parse, build chunk #9): a small, actively
+# maintained, read-focused DNS message parser with a plain public-field
+# API (Packet::questions/answers, ResourceRecord::rdata) and no
+# resolver/client/server baggage -- see dns::parse's module doc for the
+# comparison against hickory-proto and dns-parser.
+simple-dns = "0.12"
 
 [build-dependencies]
 anyhow = { workspace = true }

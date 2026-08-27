@@ -15,16 +15,44 @@
 //!     enforcement                   HashMap<u64 cgroup_id, EnforcementState>
 //!     tamper                        HashMap<u64 cgroup_id, TamperCounter>
 //!     events                        RingBuf -- shared event stream
+//!     dns_events                    RingBuf -- shared DNS-observation stream (build chunk #9)
 //!   progs/
-//!     connect4  connect6  sendmsg4  sendmsg6  sock_create
-//!                                   the five GLOBAL programs: one loaded instance each,
-//!                                   attached to every enforced container's cgroup
+//!     connect4  connect6  sendmsg4  sendmsg6  sock_create  dns_snoop
+//!                                   the six GLOBAL programs: one loaded instance each,
+//!                                   attached to every enforced container's cgroup. dns_snoop
+//!                                   (a CgroupSkb program, attached ingress) is pure DNS
+//!                                   observation -- see bathyscaphe-ebpf::dns's module doc.
 //!   links/
 //!     <cgroup_id, 16 lowercase hex digits>/
-//!       connect4  connect6  sendmsg4  sendmsg6  sock_create
+//!       connect4  connect6  sendmsg4  sendmsg6  sock_create  dns_snoop
 //!                                   per-container attach links, pinned individually so one
 //!                                   container's detach never touches another's
 //! ```
+//!
+//! # DNS observation only runs while userspace is alive
+//!
+//! Unlike the connect4/6, sendmsg4/6, and sock_create hooks (whose
+//! enforcement/observation decisions are entirely self-contained in the
+//! kernel, reading only pinned maps), `dns_snoop`'s captured payloads are
+//! useless until a *live* userspace process drains `DNS_EVENTS`, parses
+//! them, and updates the IP->domain cache (`crate::dns::DomainCache`). If
+//! bathyscaphe is dead, `dns_snoop` keeps running (it is pinned like every
+//! other program here) and keeps writing into the ring, but nothing reads
+//! it: the ring fills and the kernel starts dropping new captures the
+//! moment it's full, with no counter tracking that loss (deliberately not
+//! sharing `bathyscaphe_common::counters::TamperCounter`, since a dropped
+//! DNS capture is never a security-relevant loss the way a dropped
+//! connect/sendmsg event is -- see `bathyscaphe-ebpf::dns`'s module doc).
+//! Concretely: **a dead probe stops learning new domain names**, but
+//! **any IP already inserted into the policy allow-map by a live probe
+//! before it died keeps being enforced** (fail-closed, per the module
+//! doc above) until that entry's own TTL expires. This asymmetry --
+//! enforcement survives a dead probe, DNS learning does not -- is exactly
+//! why chunk #10 (FQDN enforcement) inserting DNS-derived IPs into the
+//! POLICY map with their own absolute TTL is the right design: the
+//! insertion is a one-time kernel-side write that outlives the userspace
+//! process that made it, even though *making new ones* requires that
+//! process to be running.
 //!
 //! Maps and programs are GLOBAL: one loaded instance each, shared by every
 //! container (see `bathyscaphe_common::policy`'s module doc for why the
@@ -68,6 +96,7 @@
 
 pub mod cgroup;
 pub mod clock;
+pub mod dns;
 pub mod enforcement;
 pub mod events;
 pub mod kernel_floor;
@@ -83,9 +112,10 @@ use anyhow::{Context, Result};
 use aya::maps::lpm_trie::LpmTrie;
 use aya::maps::{HashMap as BpfHashMap, Map, MapData, RingBuf};
 use aya::programs::links::{FdLink, PinnedLink};
-use aya::programs::{CgroupAttachMode, CgroupSock, CgroupSockAddr, CgroupSockAddrAttachType, CgroupSockAttachType};
+use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSock, CgroupSockAddr, CgroupSockAddrAttachType, CgroupSockAttachType};
 use bathyscaphe_common::{EnforcementState, PolicyKeyData, PolicyValue, TamperCounter};
 
+pub use dns::{DnsCallback, DnsCaptureConsumer};
 pub use enforcement::EnforcementStore;
 pub use events::{EventCallback, EventConsumer};
 pub use layout::{DEFAULT_BPFFS_ROOT, PinPaths};
@@ -109,10 +139,15 @@ pub struct Probe {
     sendmsg4: CgroupSockAddr,
     sendmsg6: CgroupSockAddr,
     sock_create: CgroupSock,
+    /// DNS observation (build chunk #9). A `CgroupSkb` program, attached
+    /// **ingress** -- see `bathyscaphe-ebpf::dns`'s module doc for the
+    /// program-type/direction choice.
+    dns_snoop: CgroupSkb,
     pub policy: PolicyStore,
     pub enforcement: EnforcementStore,
     pub tamper: TamperStore,
     events_map: Option<RingBuf<MapData>>,
+    dns_events_map: Option<RingBuf<MapData>>,
     containers: HashMap<u64, ContainerLinks>,
 }
 
@@ -196,6 +231,7 @@ impl Probe {
         pinned.push(attach_and_pin_sock_addr(&mut self.sendmsg4, "sendmsg4", cgroup_fd, cgroup_id, &self.paths)?);
         pinned.push(attach_and_pin_sock_addr(&mut self.sendmsg6, "sendmsg6", cgroup_fd, cgroup_id, &self.paths)?);
         pinned.push(attach_and_pin_sock(&mut self.sock_create, "sock_create", cgroup_fd, cgroup_id, &self.paths)?);
+        pinned.push(attach_and_pin_cgroup_skb(&mut self.dns_snoop, "dns_snoop", CgroupSkbAttachType::Ingress, cgroup_fd, cgroup_id, &self.paths)?);
         Ok(pinned)
     }
 
@@ -241,6 +277,13 @@ impl Probe {
         self.events_map.take()
     }
 
+    /// Takes ownership of the `DNS_EVENTS` ring buffer, for handing to
+    /// [`DnsCaptureConsumer::spawn`]. Returns `None` if already taken. See
+    /// this module's doc for why nothing reads it if the caller never does.
+    pub fn take_dns_events(&mut self) -> Option<RingBuf<MapData>> {
+        self.dns_events_map.take()
+    }
+
     /// Deletes every policy entry in the shared trie whose `expires_at_ns`
     /// has passed, using the real `CLOCK_BOOTTIME` clock. See
     /// [`PolicyStore::reap_expired`] for why this matters beyond simple
@@ -280,6 +323,7 @@ fn load_fresh_and_pin(ebpf_object: &[u8], paths: &PinPaths) -> Result<()> {
     load_and_pin_sock_addr(&mut ebpf, "sendmsg4", paths)?;
     load_and_pin_sock_addr(&mut ebpf, "sendmsg6", paths)?;
     load_and_pin_sock(&mut ebpf, "sock_create", paths)?;
+    load_and_pin_cgroup_skb(&mut ebpf, "dns_snoop", paths)?;
 
     for (ebpf_name, pin_basename) in MAP_PIN_NAMES {
         let map = ebpf.take_map(ebpf_name).with_context(|| format!("map `{ebpf_name}` not found in the embedded eBPF object"))?;
@@ -311,17 +355,30 @@ fn load_and_pin_sock(ebpf: &mut aya::Ebpf, name: &str, paths: &PinPaths) -> Resu
     Ok(())
 }
 
+fn load_and_pin_cgroup_skb(ebpf: &mut aya::Ebpf, name: &str, paths: &PinPaths) -> Result<()> {
+    let prog: &mut CgroupSkb = ebpf
+        .program_mut(name)
+        .with_context(|| format!("program `{name}` not found in the embedded eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program `{name}` is not a CgroupSkb program"))?;
+    prog.load().with_context(|| format!("verifier rejected program `{name}`"))?;
+    prog.pin(paths.prog_path(name)).with_context(|| format!("failed to pin program `{name}`"))?;
+    Ok(())
+}
+
 fn reopen_from_pins(paths: PinPaths) -> Result<Probe> {
     let connect4 = reopen_sock_addr(&paths, "connect4", CgroupSockAddrAttachType::Connect4)?;
     let connect6 = reopen_sock_addr(&paths, "connect6", CgroupSockAddrAttachType::Connect6)?;
     let sendmsg4 = reopen_sock_addr(&paths, "sendmsg4", CgroupSockAddrAttachType::UDPSendMsg4)?;
     let sendmsg6 = reopen_sock_addr(&paths, "sendmsg6", CgroupSockAddrAttachType::UDPSendMsg6)?;
     let sock_create = reopen_sock(&paths, "sock_create", CgroupSockAttachType::SockCreate)?;
+    let dns_snoop = reopen_cgroup_skb(&paths, "dns_snoop", CgroupSkbAttachType::Ingress)?;
 
     let policy_trie: LpmTrie<MapData, PolicyKeyData, PolicyValue> = reopen_map(&paths, "policy")?;
     let enforcement_map: BpfHashMap<MapData, u64, EnforcementState> = reopen_map(&paths, "enforcement")?;
     let tamper_map: BpfHashMap<MapData, u64, TamperCounter> = reopen_map(&paths, "tamper")?;
     let events_map: RingBuf<MapData> = reopen_map(&paths, "events")?;
+    let dns_events_map: RingBuf<MapData> = reopen_map(&paths, "dns_events")?;
 
     let containers = discover_containers(&paths)?;
 
@@ -332,10 +389,12 @@ fn reopen_from_pins(paths: PinPaths) -> Result<Probe> {
         sendmsg4,
         sendmsg6,
         sock_create,
+        dns_snoop,
         policy: PolicyStore::new(policy_trie),
         enforcement: EnforcementStore::new(enforcement_map),
         tamper: TamperStore::new(tamper_map),
         events_map: Some(events_map),
+        dns_events_map: Some(dns_events_map),
         containers,
     })
 }
@@ -346,6 +405,10 @@ fn reopen_sock_addr(paths: &PinPaths, name: &str, attach_type: CgroupSockAddrAtt
 
 fn reopen_sock(paths: &PinPaths, name: &str, attach_type: CgroupSockAttachType) -> Result<CgroupSock> {
     CgroupSock::from_pin(paths.prog_path(name), attach_type).with_context(|| format!("failed to reopen pinned program `{name}`"))
+}
+
+fn reopen_cgroup_skb(paths: &PinPaths, name: &str, attach_type: CgroupSkbAttachType) -> Result<CgroupSkb> {
+    CgroupSkb::from_pin(paths.prog_path(name), attach_type).with_context(|| format!("failed to reopen pinned program `{name}`"))
 }
 
 fn reopen_map<M>(paths: &PinPaths, pin_basename: &str) -> Result<M>
@@ -368,6 +431,21 @@ fn attach_and_pin_sock_addr(prog: &mut CgroupSockAddr, name: &str, cgroup_fd: &F
 
 fn attach_and_pin_sock(prog: &mut CgroupSock, name: &str, cgroup_fd: &File, cgroup_id: u64, paths: &PinPaths) -> Result<PathBuf> {
     let link_id = prog.attach(cgroup_fd, CgroupAttachMode::Single).with_context(|| format!("failed to attach `{name}` to cgroup {cgroup_id:016x}"))?;
+    let link = prog.take_link(link_id).with_context(|| format!("failed to take ownership of the `{name}` link"))?;
+    let fd_link: FdLink = link.try_into().with_context(|| format!("`{name}` link is not fd-based (pre-5.7 kernel ProgAttachLink fallback is not pinnable)"))?;
+    let pin_path = paths.container_link_path(cgroup_id, name);
+    fd_link.pin(&pin_path).with_context(|| format!("failed to pin `{name}` link to {}", pin_path.display()))?;
+    Ok(pin_path)
+}
+
+/// `CgroupSkb` variant of the two helpers above: same attach/take_link/pin
+/// shape, but `attach` additionally takes an explicit `attach_type`
+/// (`Ingress` in this workspace's only caller so far -- unlike
+/// `CgroupSockAddr`/`CgroupSock`, one loaded `CgroupSkb` program can be
+/// attached at either direction, chosen here rather than at load time; see
+/// `bathyscaphe-ebpf::dns`'s module doc).
+fn attach_and_pin_cgroup_skb(prog: &mut CgroupSkb, name: &str, attach_type: CgroupSkbAttachType, cgroup_fd: &File, cgroup_id: u64, paths: &PinPaths) -> Result<PathBuf> {
+    let link_id = prog.attach(cgroup_fd, attach_type, CgroupAttachMode::Single).with_context(|| format!("failed to attach `{name}` to cgroup {cgroup_id:016x}"))?;
     let link = prog.take_link(link_id).with_context(|| format!("failed to take ownership of the `{name}` link"))?;
     let fd_link: FdLink = link.try_into().with_context(|| format!("`{name}` link is not fd-based (pre-5.7 kernel ProgAttachLink fallback is not pinnable)"))?;
     let pin_path = paths.container_link_path(cgroup_id, name);

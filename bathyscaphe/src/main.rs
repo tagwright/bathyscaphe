@@ -12,6 +12,7 @@
 mod attribution;
 mod cli;
 mod daemon;
+mod dns;
 mod pipeline;
 mod probe;
 

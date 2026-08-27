@@ -6,11 +6,14 @@
 //! #7's daemon needs no adapter code, just the concrete types it already
 //! owns.
 
+use std::net::IpAddr;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use bathyscaphe_common::TamperCounter;
 use bathyscaphe_proto::UpMessage;
+
+use crate::dns::DomainHit;
 
 /// Where a mapped wire `Event` (wrapped in its `UpMessage::Event` envelope,
 /// so a sink can just as well carry `hello`/`stats`/other kinds down the
@@ -67,6 +70,34 @@ impl<T: TamperSource> TamperSource for Arc<Mutex<T>> {
     fn read_tamper(&self, cgroup_id: u64) -> anyhow::Result<TamperCounter> {
         let guard = self.lock().map_err(|_| anyhow::anyhow!("tamper store mutex poisoned"))?;
         guard.read_tamper(cgroup_id)
+    }
+}
+
+/// Where [`super::map::map_event`]'s `domain.*` enrichment comes from
+/// (build chunk #9): the per-container IP->domain cache
+/// (`crate::dns::DomainCache`), populated by the DNS ring-buffer consumer
+/// on a different thread than the one that reads it -- same
+/// trait-over-a-shared-store shape as [`TamperSource`], for the same
+/// reason (unit-testable against a stub with no ring buffer, no DNS
+/// parser, no lock in sight).
+pub trait DomainLookupSource: Send {
+    fn lookup_domain(&self, cgroup_id: u64, addr: IpAddr, now_boottime_ns: u64) -> Option<DomainHit>;
+}
+
+impl DomainLookupSource for crate::dns::DomainCache {
+    fn lookup_domain(&self, cgroup_id: u64, addr: IpAddr, now_boottime_ns: u64) -> Option<DomainHit> {
+        crate::dns::DomainCache::lookup(self, cgroup_id, addr, now_boottime_ns)
+    }
+}
+
+/// Lets the daemon share one `DomainCache` between the DNS ring-buffer
+/// consumer thread (writer) and the connect-event pipeline (reader) --
+/// the identical `Arc<Mutex<T>>` sharing convention as [`TamperSource`]'s
+/// blanket impl above.
+impl<T: DomainLookupSource> DomainLookupSource for Arc<Mutex<T>> {
+    fn lookup_domain(&self, cgroup_id: u64, addr: IpAddr, now_boottime_ns: u64) -> Option<DomainHit> {
+        let guard = self.lock().unwrap_or_else(|poison| poison.into_inner());
+        guard.lookup_domain(cgroup_id, addr, now_boottime_ns)
     }
 }
 

@@ -13,12 +13,13 @@
 //!
 //! ```text
 //! let attribution = attribution::AttributionService::start()?;
-//! let pipeline = pipeline::Pipeline::new(attribution.resolver.clone(), tamper_source, sink)?;
+//! let pipeline = pipeline::Pipeline::new(attribution.resolver.clone(), tamper_source, domain_cache, sink)?;
 //! let consumer = probe::EventConsumer::spawn(ring, pipeline.into_callback());
 //! ```
 //!
-//! [`sink::EventSink`] and [`sink::TamperSource`] are the two seams this
-//! chunk defines and chunk #7 plugs into; see that module's doc.
+//! [`sink::EventSink`], [`sink::TamperSource`], and (build chunk #9)
+//! [`sink::DomainLookupSource`] are the seams this and the DAEMON chunk
+//! plug into; see that module's doc.
 
 pub mod dropped;
 pub mod map;
@@ -33,7 +34,7 @@ use crate::probe::EventCallback;
 
 pub use dropped::DroppedTracker;
 pub use map::map_event;
-pub use sink::{EventSink, TamperSource};
+pub use sink::{DomainLookupSource, EventSink, TamperSource};
 
 /// Samples the wall-clock/`CLOCK_BOOTTIME` offset once, at pipeline
 /// construction time: `wall_now_ns - boot_now_ns`. Adding this to any
@@ -51,25 +52,28 @@ fn sample_boot_offset_ns() -> Result<i128> {
 }
 
 /// The stateful adapter: one per running probe, owns the attribution
-/// resolver, the tamper-counter source, the dropped-event tracker, and the
-/// sink every mapped event goes to.
-pub struct Pipeline<A, T, S> {
+/// resolver, the tamper-counter source, the DNS domain-lookup source
+/// (build chunk #9), the dropped-event tracker, and the sink every mapped
+/// event goes to.
+pub struct Pipeline<A, T, D, S> {
     attributor: A,
     tamper: T,
+    domain_lookup: D,
     dropped: DroppedTracker,
     boot_offset_ns: i128,
     sink: S,
 }
 
-impl<A, T, S> Pipeline<A, T, S>
+impl<A, T, D, S> Pipeline<A, T, D, S>
 where
     A: Attributor,
     T: TamperSource,
+    D: DomainLookupSource,
     S: EventSink,
 {
-    pub fn new(attributor: A, tamper: T, sink: S) -> Result<Self> {
+    pub fn new(attributor: A, tamper: T, domain_lookup: D, sink: S) -> Result<Self> {
         let boot_offset_ns = sample_boot_offset_ns()?;
-        Ok(Self { attributor, tamper, dropped: DroppedTracker::new(), boot_offset_ns, sink })
+        Ok(Self { attributor, tamper, domain_lookup, dropped: DroppedTracker::new(), boot_offset_ns, sink })
     }
 
     /// Maps one kernel event and hands it to the sink, or silently skips it
@@ -80,7 +84,7 @@ where
     /// ring-buffer loss; this is a distinct, expected-to-be-vanishingly-rare
     /// failure mode at the userspace attribution boundary instead.
     pub fn handle(&mut self, kernel_event: KernelEvent) {
-        match map_event(&kernel_event, &self.attributor, &self.tamper, &self.dropped, self.boot_offset_ns) {
+        match map_event(&kernel_event, &self.attributor, &self.tamper, &self.domain_lookup, &self.dropped, self.boot_offset_ns) {
             Some(wire_event) => self.sink.emit(UpMessage::Event(wire_event)),
             None => {
                 eprintln!("bathyscaphe: dropping one event with no resolvable container attribution at all for cgroup {:016x} (not a ring-buffer loss; see pipeline::map::map_event's doc)", kernel_event.cgroup_id);
@@ -89,10 +93,11 @@ where
     }
 }
 
-impl<A, T, S> Pipeline<A, T, S>
+impl<A, T, D, S> Pipeline<A, T, D, S>
 where
     A: Attributor + Send + 'static,
     T: TamperSource + Send + 'static,
+    D: DomainLookupSource + Send + 'static,
     S: EventSink + Send + 'static,
 {
     /// Consumes this pipeline into the exact callback shape
@@ -127,6 +132,13 @@ mod tests {
         }
     }
 
+    struct StubDomainLookup;
+    impl DomainLookupSource for StubDomainLookup {
+        fn lookup_domain(&self, _cgroup_id: u64, _addr: std::net::IpAddr, _now_boottime_ns: u64) -> Option<crate::dns::DomainHit> {
+            None
+        }
+    }
+
     /// A capturing sink for tests: every emitted `UpMessage` lands in a
     /// shared `Vec`, inspectable after handing a clone into something that
     /// takes ownership (the pipeline, or an `EventConsumer`).
@@ -145,7 +157,7 @@ mod tests {
     #[test]
     fn pipeline_handle_emits_a_mapped_wire_event_to_the_sink() {
         let sink = CapturingSink::default();
-        let mut pipeline = Pipeline::new(StubAttributor(attribution()), StubTamper, sink.clone()).expect("sampling the boot offset should succeed on any real host");
+        let mut pipeline = Pipeline::new(StubAttributor(attribution()), StubTamper, StubDomainLookup, sink.clone()).expect("sampling the boot offset should succeed on any real host");
 
         let mut kernel_event = KernelEvent::default();
         kernel_event.dst_port = 8080u16.to_be_bytes();
@@ -170,7 +182,7 @@ mod tests {
     #[test]
     fn into_callback_matches_event_consumer_wiring_end_to_end_through_an_mpsc_sink() {
         let (tx, rx) = mpsc::channel::<UpMessage>();
-        let pipeline = Pipeline::new(StubAttributor(attribution()), StubTamper, tx).expect("sampling the boot offset should succeed on any real host");
+        let pipeline = Pipeline::new(StubAttributor(attribution()), StubTamper, StubDomainLookup, tx).expect("sampling the boot offset should succeed on any real host");
 
         let mut callback: EventCallback = pipeline.into_callback();
         callback(KernelEvent::default());

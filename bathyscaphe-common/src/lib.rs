@@ -40,15 +40,19 @@
 //! - [`event`]: [`event::Event`], the kernel-written `RingBuf` record.
 //! - [`counters`]: [`counters::TamperCounter`], the per-cgroup
 //!   ring-buffer-drop counter.
+//! - [`dns`]: [`dns::DnsCapture`], the kernel-written DNS-snoop `RingBuf`
+//!   record (build chunk #9's DNS observation layer).
 #![no_std]
 
 pub mod counters;
+pub mod dns;
 pub mod enforcement;
 pub mod enums;
 pub mod event;
 pub mod policy;
 
 pub use counters::TamperCounter;
+pub use dns::{DNS_CAPTURE_MAX, DnsCapture};
 pub use enforcement::EnforcementState;
 pub use enums::{DefaultVerdict, EventType, InvalidDiscriminant, Mode, RuleAction, RuleSource, TransportProto, Verdict};
 pub use event::Event;

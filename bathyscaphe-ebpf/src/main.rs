@@ -2,7 +2,7 @@
 //! `bathyscaphe-ebpf`: the kernel-side programs, built with `bpf-linker`
 //! against a `bpfel`/`bpfeb`-unknown-none target (see docs/BUILDING.md).
 //!
-//! Five attach points, all sharing the maps in [`maps`] and the single
+//! Six attach points, all sharing the maps in [`maps`] and the single
 //! decision routine in [`decide`] (`bathy_ebpf_design.md` sections 1a and
 //! 6):
 //!
@@ -19,17 +19,23 @@
 //!   in the pinned `aya-ebpf-macros` (`#[cgroup_sock(sock_create)]`,
 //!   attach type `BPF_CGROUP_INET_SOCK_CREATE`) — implemented, not
 //!   deferred.
+//! - `cgroup_skb` (attached ingress, function name `dns_snoop`) — DNS
+//!   observation (build chunk #9): recognizes a UDP:53-sourced datagram
+//!   and captures a bounded prefix of its payload for userspace to parse.
+//!   Pure observation, always returns `1` (pass) regardless of what it
+//!   finds — see [`dns::try_dns_snoop`]'s module doc for the full design.
 #![no_std]
 #![no_main]
 
 mod convert;
 mod decide;
+mod dns;
 mod maps;
 
 use aya_ebpf::{
     helpers::bpf_get_current_cgroup_id,
-    macros::{cgroup_sock, cgroup_sock_addr},
-    programs::{SockAddrContext, SockContext},
+    macros::{cgroup_skb, cgroup_sock, cgroup_sock_addr},
+    programs::{SkBuffContext, SockAddrContext, SockContext},
 };
 use bathyscaphe_common::{EventType, Mode, TransportProto};
 
@@ -116,6 +122,18 @@ fn try_sock_create(ctx: SockContext) -> Result<i32, i32> {
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let blocked = matches!(unsafe { ENFORCEMENT.get(cgroup_id) }, Some(es) if es.mode == Mode::Block as u8);
     Ok(if blocked { 0 } else { 1 })
+}
+
+/// DNS observation (build chunk #9). Attached **ingress** (the direction is
+/// chosen at attach time in userspace, not by this macro — see
+/// `dns::try_dns_snoop`'s module doc). Always returns `1` (pass): this
+/// program never gates traffic, only observes it, so a verifier-safe
+/// parsing miss, a malformed packet, or a full `DNS_EVENTS` ring never has
+/// any effect on the container's actual connectivity.
+#[cgroup_skb]
+pub fn dns_snoop(ctx: SkBuffContext) -> i32 {
+    let _ = dns::try_dns_snoop(&ctx);
+    1
 }
 
 #[cfg(not(test))]

@@ -5,12 +5,12 @@
 use std::net::{IpAddr, Ipv6Addr};
 
 use bathyscaphe_common::enums::Verdict as KernelVerdict;
-use bathyscaphe_proto::{Container, Domain, Endpoint, Event as WireEvent, EventMeta, Process, Verdict as WireVerdict};
+use bathyscaphe_proto::{Container, Domain, DomainSource, Endpoint, Event as WireEvent, EventMeta, Process, Verdict as WireVerdict};
 
 use crate::attribution::Attributor;
 
 use super::dropped::DroppedTracker;
-use super::sink::TamperSource;
+use super::sink::{DomainLookupSource, TamperSource};
 
 /// Maps one kernel-observed `Event` onto the wire protocol's `Event`, or
 /// `None` if attribution came back completely empty -- the one case where
@@ -23,7 +23,7 @@ use super::sink::TamperSource;
 /// attached to a cgroup this process already resolved once, to attach to
 /// it) -- see [`Attributor::resolve`]'s doc for exactly when it can still
 /// occur.
-pub fn map_event(kernel_event: &bathyscaphe_common::Event, attributor: &impl Attributor, tamper: &impl TamperSource, dropped: &DroppedTracker, boot_offset_ns: i128) -> Option<WireEvent> {
+pub fn map_event(kernel_event: &bathyscaphe_common::Event, attributor: &impl Attributor, tamper: &impl TamperSource, domain_lookup: &impl DomainLookupSource, dropped: &DroppedTracker, boot_offset_ns: i128) -> Option<WireEvent> {
     let attribution = attributor.resolve(kernel_event.cgroup_id)?;
 
     let container = Container { id: attribution.container_id, name: attribution.name, image: attribution.image, runtime: attribution.runtime };
@@ -34,6 +34,11 @@ pub fn map_event(kernel_event: &bathyscaphe_common::Event, attributor: &impl Att
     let src = Endpoint { addr: unmap_addr(kernel_event.src_addr), port: u16::from_be_bytes(kernel_event.src_port) };
     let dst = Endpoint { addr: unmap_addr(kernel_event.dst_addr), port: u16::from_be_bytes(kernel_event.dst_port) };
     let ts = format_ts(kernel_event.ktime_ns, boot_offset_ns);
+    // The DNS cache lookup uses the connect event's OWN kernel timestamp as
+    // "now", not a freshly sampled clock -- see `DomainCache::lookup`'s
+    // doc for why this is the semantically correct choice (was the DNS
+    // answer still fresh AT THE MOMENT of this specific connection).
+    let domain = decode_domain(domain_lookup, kernel_event.cgroup_id, dst.addr, kernel_event.ktime_ns);
 
     let current_total = match tamper.read_tamper(kernel_event.cgroup_id) {
         Ok(counter) => counter.events_dropped,
@@ -57,10 +62,7 @@ pub fn map_event(kernel_event: &bathyscaphe_common::Event, attributor: &impl Att
         // field at all yet -- this build genuinely does not track it, the
         // documented `rule_id: None` case in docs/PROTOCOL.md section 3.
         rule_id: None,
-        // The DNS/SNI layer (build sequence step #8) is what ever
-        // populates this; every pre-DNS-layer build emits the all-null
-        // shape uniformly.
-        domain: Domain::unresolved(),
+        domain,
         meta: EventMeta { dropped_since_last },
     })
 }
@@ -139,6 +141,20 @@ fn decode_verdict(raw_verdict: u8, would_deny: u8) -> WireVerdict {
     }
 }
 
+/// `domain.*` enrichment (build chunk #9): a cache hit on `dst_addr` for
+/// this event's container populates `name`/`source: dns`/`confidence`;
+/// a miss (never resolved, resolved via DoH/DoT and therefore invisible to
+/// the snoop, raw-IP egress with no DNS lookup at all, or an entry past
+/// its grace window) emits the all-null [`Domain::unresolved`] shape --
+/// see `docs/DNS.md`'s "why `domain` is null" list for the full account of
+/// the causes this single `None` branch collapses.
+fn decode_domain(domain_lookup: &impl DomainLookupSource, cgroup_id: u64, dst_addr: std::net::IpAddr, now_boottime_ns: u64) -> Domain {
+    match domain_lookup.lookup_domain(cgroup_id, dst_addr, now_boottime_ns) {
+        Some(hit) => Domain { name: Some(hit.name), source: Some(DomainSource::Dns), confidence: Some(hit.confidence) },
+        None => Domain::unresolved(),
+    }
+}
+
 /// `bathyscaphe_common::event::Event::src_addr`/`dst_addr` carry an
 /// IPv4-mapped-into-IPv6 embedding (RFC 4291) for a v4 address, matching
 /// `bathyscaphe_common::policy::PolicyKeyData::addr`'s convention.
@@ -188,6 +204,17 @@ mod tests {
         fn read_tamper(&self, _cgroup_id: u64) -> anyhow::Result<TamperCounter> {
             Ok(TamperCounter::new(self.0))
         }
+    }
+
+    struct StubDomainLookup(Option<crate::dns::DomainHit>);
+    impl DomainLookupSource for StubDomainLookup {
+        fn lookup_domain(&self, _cgroup_id: u64, _addr: IpAddr, _now_boottime_ns: u64) -> Option<crate::dns::DomainHit> {
+            self.0.clone()
+        }
+    }
+
+    fn no_domain() -> StubDomainLookup {
+        StubDomainLookup(None)
     }
 
     fn docker_attribution() -> Attribution {
@@ -272,7 +299,7 @@ mod tests {
         let tamper = StubTamper(0);
         let dropped = DroppedTracker::new();
 
-        let wire = map_event(&kernel_event, &attributor, &tamper, &dropped, 0).expect("full attribution should always map to Some");
+        let wire = map_event(&kernel_event, &attributor, &tamper, &no_domain(), &dropped, 0).expect("full attribution should always map to Some");
         assert_eq!(wire.container.id, "a".repeat(64));
         assert_eq!(wire.container.name.as_deref(), Some("web"));
         assert_eq!(wire.container.image.as_deref(), Some("nginx:latest"));
@@ -290,7 +317,7 @@ mod tests {
         let tamper = StubTamper(0);
         let dropped = DroppedTracker::new();
 
-        let wire = map_event(&kernel_event, &attributor, &tamper, &dropped, 0).expect("partial attribution (name/image races lost) must still emit");
+        let wire = map_event(&kernel_event, &attributor, &tamper, &no_domain(), &dropped, 0).expect("partial attribution (name/image races lost) must still emit");
         assert_eq!(wire.container.id, "b".repeat(64));
         assert_eq!(wire.container.name, None);
         assert_eq!(wire.container.image, None);
@@ -304,7 +331,33 @@ mod tests {
         let tamper = StubTamper(0);
         let dropped = DroppedTracker::new();
 
-        assert_eq!(map_event(&kernel_event, &attributor, &tamper, &dropped, 0), None);
+        assert_eq!(map_event(&kernel_event, &attributor, &tamper, &no_domain(), &dropped, 0), None);
+    }
+
+    #[test]
+    fn map_event_populates_domain_on_a_cache_hit() {
+        let kernel_event = bathyscaphe_common::Event::default();
+        let attributor = StubAttributor(Some(docker_attribution()));
+        let tamper = StubTamper(0);
+        let dropped = DroppedTracker::new();
+        let hit = crate::dns::DomainHit { name: "example.com".to_string(), confidence: bathyscaphe_proto::DomainConfidence::Asserted };
+        let domain_lookup = StubDomainLookup(Some(hit));
+
+        let wire = map_event(&kernel_event, &attributor, &tamper, &domain_lookup, &dropped, 0).unwrap();
+        assert_eq!(wire.domain.name.as_deref(), Some("example.com"));
+        assert_eq!(wire.domain.source, Some(DomainSource::Dns));
+        assert_eq!(wire.domain.confidence, Some(bathyscaphe_proto::DomainConfidence::Asserted));
+    }
+
+    #[test]
+    fn map_event_leaves_domain_null_on_a_cache_miss() {
+        let kernel_event = bathyscaphe_common::Event::default();
+        let attributor = StubAttributor(Some(docker_attribution()));
+        let tamper = StubTamper(0);
+        let dropped = DroppedTracker::new();
+
+        let wire = map_event(&kernel_event, &attributor, &tamper, &no_domain(), &dropped, 0).unwrap();
+        assert_eq!(wire.domain, Domain::unresolved());
     }
 
     #[test]

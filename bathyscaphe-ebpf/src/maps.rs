@@ -27,6 +27,14 @@ const ENFORCEMENT_MAX_ENTRIES: u32 = 4096;
 const TAMPER_MAX_ENTRIES: u32 = 4096;
 /// 256 KiB, a power-of-two multiple of a 4 KiB page as `RingBuf` requires.
 const EVENTS_BYTE_SIZE: u32 = 256 * 1024;
+/// 128 KiB, same page-alignment requirement as [`EVENTS_BYTE_SIZE`].
+/// Smaller than `EVENTS` despite each record being larger
+/// (`DnsCapture::WIRE_SIZE` is 536 bytes versus `Event::WIRE_SIZE`'s 88):
+/// DNS response traffic is far lower-frequency than connect/sendmsg
+/// traffic for any real container, and a placeholder chosen independently
+/// of the `EVENTS` sizing on purpose -- see `bathyscaphe_common::dns`'s
+/// module doc for why this is a *separate* ring rather than a shared one.
+const DNS_EVENTS_BYTE_SIZE: u32 = 128 * 1024;
 
 /// The shared policy trie. Key: `cgroup_id (8 bytes) || addr (16 bytes)`,
 /// `prefix_len` always `>= PolicyKeyData::MIN_PREFIX_LEN` for any stored
@@ -52,3 +60,10 @@ pub static TAMPER: HashMap<u64, TamperCounter> = HashMap::with_max_entries(TAMPE
 /// "one hook, two output paths").
 #[map]
 pub static EVENTS: RingBuf = RingBuf::with_byte_size(EVENTS_BYTE_SIZE, 0);
+
+/// The DNS-observation output ring, written by `dns_snoop`
+/// (`bathyscaphe-ebpf::dns`) for every recognized DNS-response UDP
+/// datagram. Separate from [`EVENTS`] -- see [`DNS_EVENTS_BYTE_SIZE`]'s
+/// doc.
+#[map]
+pub static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(DNS_EVENTS_BYTE_SIZE, 0);

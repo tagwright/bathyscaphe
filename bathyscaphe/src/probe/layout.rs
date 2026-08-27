@@ -15,12 +15,20 @@ pub const DEFAULT_BPFFS_ROOT: &str = "/sys/fs/bpf/bathyscaphe";
 /// SCREAMING_CASE, pin paths are lowercase) -- kept as an explicit pairing
 /// rather than a `.to_lowercase()` call so a future rename on either side is
 /// a compile-visible edit here, not a silent runtime mismatch.
-pub(crate) const MAP_PIN_NAMES: [(&str, &str); 4] =
-    [("POLICY", "policy"), ("ENFORCEMENT", "enforcement"), ("TAMPER", "tamper"), ("EVENTS", "events")];
+pub(crate) const MAP_PIN_NAMES: [(&str, &str); 5] =
+    [("POLICY", "policy"), ("ENFORCEMENT", "enforcement"), ("TAMPER", "tamper"), ("EVENTS", "events"), ("DNS_EVENTS", "dns_events")];
 
 /// Program names, identical in the ELF and on bpffs (both are just the
 /// `bathyscaphe-ebpf` function names -- see that crate's `main.rs`).
-pub(crate) const PROG_NAMES: [&str; 5] = ["connect4", "connect6", "sendmsg4", "sendmsg6", "sock_create"];
+/// `dns_snoop` (build chunk #9, DNS observation) is a `CgroupSkb` program,
+/// loaded/attached/reopened through a different typed helper than the
+/// `CgroupSockAddr`/`CgroupSock` five before it (see `probe::mod`'s
+/// `attach_and_pin_cgroup_skb`/`load_and_pin_cgroup_skb`/`reopen_cgroup_skb`),
+/// but its pin PATH is exactly as type-agnostic as every other entry here:
+/// this list drives `pin_state`'s existence checks, the per-container link
+/// rollback loop, and `discover_containers`' walk, none of which care what
+/// program type produced a given pinned link file.
+pub(crate) const PROG_NAMES: [&str; 6] = ["connect4", "connect6", "sendmsg4", "sendmsg6", "sock_create", "dns_snoop"];
 
 /// Path arithmetic for the pin subtree. Never touches the filesystem itself
 /// (see [`crate::probe::Probe`] for the calls that do); this is pure enough
