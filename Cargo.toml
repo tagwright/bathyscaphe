@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "bathyscaphe-common",
+    "bathyscaphe-ebpf",
+    "bathyscaphe-proto",
+    "bathyscaphe",
+]
+# bathyscaphe-ebpf is deliberately excluded from the default members: it only
+# builds against the nightly toolchain with a bpfel/bpfeb-unknown-none
+# target and -Z build-std=core (see docs/BUILDING.md). It gets built as a
+# side effect of building the bathyscaphe binary crate, whose build.rs
+# invokes it out of band via aya-build. A plain `cargo build` at the
+# workspace root (stable toolchain) must not try to compile it directly.
+default-members = [
+    "bathyscaphe-common",
+    "bathyscaphe-proto",
+    "bathyscaphe",
+]
+
+[workspace.package]
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { version = "0.14.0", default-features = false }
+aya-build = { version = "0.2.0", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+which = { version = "6.0.0", default-features = false }
+
+[profile.release.package.bathyscaphe-ebpf]
+debug = 2
+codegen-units = 1
+strip = false

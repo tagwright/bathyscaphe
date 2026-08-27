@@ -1,0 +1,19 @@
+# Build output (Cargo.lock is committed on purpose: this workspace ships
+# binaries, and a pinned lockfile is what makes the toolchain proof in
+# docs/BUILDING.md reproducible).
+/target/
+**/target/
+
+# eBPF build artifacts (bpf-linker output, raw object files if built
+# outside of target/)
+*.bpf.o
+/bathyscaphe-ebpf/*.o
+
+# Local dev
+.env
+*.local
+
+# bpffs pin paths never belong in the repo, but guard against someone
+# accidentally dumping a debug copy in-tree
+/pinned/
+/sys-fs-bpf-debug/

@@ -1,0 +1,21 @@
+[package]
+name = "bathyscaphe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bathyscaphe-common = { path = "../bathyscaphe-common", features = ["user"] }
+bathyscaphe-proto = { path = "../bathyscaphe-proto" }
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+bathyscaphe-ebpf = { path = "../bathyscaphe-ebpf" }
+
+[[bin]]
+name = "bathyscaphe"
+path = "src/main.rs"
