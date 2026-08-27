@@ -2,24 +2,43 @@
 //! `bathyscaphe-ebpf`: the kernel-side programs, built with `bpf-linker`
 //! against a `bpfel`/`bpfeb`-unknown-none target (see docs/BUILDING.md).
 //!
-//! This chunk is the toolchain proof: one real, trivial cgroup/connect4
-//! program (`aya::programs::CgroupSockAddr`, attach type
-//! `BPF_CGROUP_INET4_CONNECT`) that always allows the connection. It
-//! exercises the full compile path (no_std, aya-ebpf macros, bpf-linker)
-//! without yet doing any policy work. The real connect4/connect6 +
-//! udp4/6-sendmsg + sock_create programs, the LpmTrie policy lookup, the
-//! RingBuf event emission, and the per-cgroup tamper counter described in
-//! `bathy_ebpf_design.md` land in the EBPF PROGRAMS build chunk.
+//! Five attach points, all sharing the maps in [`maps`] and the single
+//! decision routine in [`decide`] (`bathy_ebpf_design.md` sections 1a and
+//! 6):
+//!
+//! - `cgroup/connect4`, `cgroup/connect6` — primary enforcement +
+//!   observation hook (`BPF_CGROUP_INET4_CONNECT` / `_INET6_CONNECT`).
+//! - `cgroup/sendmsg4`, `cgroup/sendmsg6` — the unconnected-UDP companion
+//!   (`BPF_CGROUP_UDP4_SENDMSG` / `_UDP6_SENDMSG`), same decision logic,
+//!   proto hardcoded to UDP since these attach types are UDP-only by
+//!   construction.
+//! - `cgroup/sock_create` — denies `SOCK_RAW` socket creation outright
+//!   for any cgroup whose [`bathyscaphe_common::EnforcementState::mode`]
+//!   is `Block`, closing the raw-socket gap connect/sendmsg can't see
+//!   (`bathy_ebpf_design.md` section 1d). This program type IS available
+//!   in the pinned `aya-ebpf-macros` (`#[cgroup_sock(sock_create)]`,
+//!   attach type `BPF_CGROUP_INET_SOCK_CREATE`) — implemented, not
+//!   deferred.
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext};
-use bathyscaphe_common::Event;
+mod convert;
+mod decide;
+mod maps;
 
-/// Primary enforcement + observation hook (bathy_ebpf_design.md, section
-/// 1a / 6.1). Returning `1` allows the connection; `0` would deny it
-/// (surfaces as `EPERM` to the caller). For now this always allows: the
-/// policy-map lookup and the observe/enforce split are not built yet.
+use aya_ebpf::{
+    helpers::bpf_get_current_cgroup_id,
+    macros::{cgroup_sock, cgroup_sock_addr},
+    programs::{SockAddrContext, SockContext},
+};
+use bathyscaphe_common::{EventType, Mode, TransportProto};
+
+use crate::{
+    convert::{dst_addr_v4, dst_addr_v6, dst_port, proto_from_context},
+    decide::{DestTuple, decide_and_emit},
+    maps::ENFORCEMENT,
+};
+
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
     match try_connect4(ctx) {
@@ -28,16 +47,75 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
     }
 }
 
-fn try_connect4(_ctx: SockAddrContext) -> Result<i32, i32> {
-    // Touch bathyscaphe-common's shared repr(C) event type from the kernel
-    // side, proving it compiles for both the BPF target here and the host
-    // target in userspace. No RingBuf, no policy lookup yet -- both land
-    // in the EBPF PROGRAMS build chunk, which consumes the map/event
-    // schema this crate's COMMON build chunk defines.
-    let _event = Event::default();
+fn try_connect4(ctx: SockAddrContext) -> Result<i32, i32> {
+    let sa = unsafe { &*ctx.sock_addr };
+    let dest = DestTuple { dst_addr: dst_addr_v4(sa), dst_port: dst_port(sa), proto: proto_from_context(sa) };
+    Ok(decide_and_emit(dest, EventType::Connect))
+}
 
-    // Always allow. See EBPF PROGRAMS build chunk for the real verdict.
-    Ok(1)
+#[cgroup_sock_addr(connect6)]
+pub fn connect6(ctx: SockAddrContext) -> i32 {
+    match try_connect6(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_connect6(ctx: SockAddrContext) -> Result<i32, i32> {
+    let sa = unsafe { &*ctx.sock_addr };
+    let dest = DestTuple { dst_addr: dst_addr_v6(sa), dst_port: dst_port(sa), proto: proto_from_context(sa) };
+    Ok(decide_and_emit(dest, EventType::Connect))
+}
+
+#[cgroup_sock_addr(sendmsg4)]
+pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
+    match try_sendmsg4(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sendmsg4(ctx: SockAddrContext) -> Result<i32, i32> {
+    let sa = unsafe { &*ctx.sock_addr };
+    let dest = DestTuple { dst_addr: dst_addr_v4(sa), dst_port: dst_port(sa), proto: TransportProto::Udp as u8 };
+    Ok(decide_and_emit(dest, EventType::Connect))
+}
+
+#[cgroup_sock_addr(sendmsg6)]
+pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
+    match try_sendmsg6(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sendmsg6(ctx: SockAddrContext) -> Result<i32, i32> {
+    let sa = unsafe { &*ctx.sock_addr };
+    let dest = DestTuple { dst_addr: dst_addr_v6(sa), dst_port: dst_port(sa), proto: TransportProto::Udp as u8 };
+    Ok(decide_and_emit(dest, EventType::Connect))
+}
+
+/// `SOCK_RAW` (`include/linux/net.h`). Not re-exported by
+/// `aya-ebpf-bindings` as a named constant at the pinned version, so
+/// declared locally.
+const SOCK_RAW: u32 = 3;
+
+#[cgroup_sock(sock_create)]
+pub fn sock_create(ctx: SockContext) -> i32 {
+    match try_sock_create(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sock_create(ctx: SockContext) -> Result<i32, i32> {
+    let sock = unsafe { &*ctx.sock };
+    if sock.type_ != SOCK_RAW {
+        return Ok(1);
+    }
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let blocked = matches!(unsafe { ENFORCEMENT.get(cgroup_id) }, Some(es) if es.mode == Mode::Block as u8);
+    Ok(if blocked { 0 } else { 1 })
 }
 
 #[cfg(not(test))]

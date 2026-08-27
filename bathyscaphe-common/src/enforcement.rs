@@ -39,11 +39,14 @@ pub struct EnforcementState {
     pub mode: u8,
     /// [`crate::enums::DefaultVerdict`] as a raw `u8`: what the kernel
     /// hook returns for a destination that matches no entry in this
-    /// container's policy map-in-map trie (and no [`crate::policy::ExactPortKey`]
-    /// entry, if that map is wired). This is the "empty/never-configured
-    /// policy" question the eBPF design brief's fork #1 raises, and it is
-    /// answered per-container, explicitly, on the wire (`policy.default`)
-    /// — never a single hardcoded kernel constant.
+    /// container's policy trie at all (see `crate::policy`'s module doc
+    /// for why v1 uses one flat, cgroup-id-prefixed `LpmTrie` rather than
+    /// true per-container map-in-map — this field's meaning is unaffected
+    /// either way: "no entry", full stop). This is the
+    /// "empty/never-configured policy" question the eBPF design brief's
+    /// fork #1 raises, and it is answered per-container, explicitly, on
+    /// the wire (`policy.default`) — never a single hardcoded kernel
+    /// constant.
     pub default_verdict: u8,
     /// Reserved for future per-container bits (none assigned). Always
     /// `0` in this build.

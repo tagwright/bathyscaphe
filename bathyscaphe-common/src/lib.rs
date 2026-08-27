@@ -16,8 +16,10 @@
 //!
 //! See `bathy_ebpf_design.md` (the eBPF design brief) for the map/hook
 //! architecture this crate's types implement, and `policy.rs` in
-//! particular for the in-kernel policy map schema — the load-bearing
-//! design decision of this build chunk, flagged there for arbitration.
+//! particular for the in-kernel policy map schema — ratified 2026-08-27
+//! as a nested per-prefix-port-rules scheme, with a documented,
+//! toolchain-forced deviation from true per-container map-in-map (aya's
+//! map-in-map support is unmerged upstream as of this writing).
 //!
 //! ## Module map
 //!
@@ -27,9 +29,11 @@
 //!   used directly as a map key/value type — see that module's doc for
 //!   why.
 //! - [`policy`]: the in-kernel policy map schema — [`policy::PolicyKeyData`]
-//!   (the `LpmTrie` key's `data` portion), [`policy::PolicyValue`] (the
-//!   `LpmTrie` value), and [`policy::ExactPortKey`] (the flagged
-//!   mitigation type for the "any address, specific port" LPM gap).
+//!   (the `LpmTrie` key's `data` portion, `cgroup_id` folded in as a
+//!   toolchain-forced substitute for true map-in-map, see that module's
+//!   doc), [`policy::PolicyValue`] (the `LpmTrie` value: a per-prefix
+//!   default action plus up to [`policy::MAX_PORT_RULES`] bounded
+//!   [`policy::PortRule`]s).
 //! - [`enforcement`]: [`enforcement::EnforcementState`], the outer
 //!   per-cgroup map value (mode, default verdict, generation) that gates
 //!   whether a container is enforced at all.
@@ -48,4 +52,4 @@ pub use counters::TamperCounter;
 pub use enforcement::EnforcementState;
 pub use enums::{DefaultVerdict, EventType, InvalidDiscriminant, Mode, RuleAction, RuleSource, TransportProto, Verdict};
 pub use event::Event;
-pub use policy::{ExactPortKey, PolicyKeyData, PolicyValue};
+pub use policy::{MAX_PORT_RULES, PolicyKeyData, PolicyValue, PortRule};
