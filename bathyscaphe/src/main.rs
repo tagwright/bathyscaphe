@@ -22,11 +22,13 @@ fn main() {
     println!("bathyscaphe {}", VERSION.trim());
     println!("eBPF object embedded: {} bytes", EBPF_OBJECT.len());
 
-    // Prove bathyscaphe-common (still placeholder types at this build
-    // chunk) and bathyscaphe-proto (the real, frozen wire protocol as of
-    // the PROTO build chunk) are both wired in and usable from the
-    // userspace binary.
-    let _shared_type = bathyscaphe_common::PlaceholderRecord::default();
+    // Prove bathyscaphe-common (the real map/event ABI types as of the
+    // COMMON build chunk) and bathyscaphe-proto (the real, frozen wire
+    // protocol as of the PROTO build chunk) are both wired in and usable
+    // from the userspace binary, including the `user`-feature `aya::Pod`
+    // impls.
+    let _shared_event = bathyscaphe_common::Event::default();
+    let _shared_policy_key = bathyscaphe_common::PolicyKeyData::default();
     let hello = bathyscaphe_proto::Hello {
         backend: "bathyscaphe".to_string(),
         backend_version: VERSION.trim().to_string(),
@@ -36,7 +38,7 @@ fn main() {
     };
     let _wire_line = bathyscaphe_proto::encode_line(&bathyscaphe_proto::UpMessage::Hello(hello))
         .expect("hello message encodes");
-    println!("bathyscaphe-common skeleton type and bathyscaphe-proto wire types constructed OK");
+    println!("bathyscaphe-common ABI types and bathyscaphe-proto wire types constructed OK");
 }
 
 /// Stub for the real loader. Not called yet -- see `bathy_ebpf_design.md`

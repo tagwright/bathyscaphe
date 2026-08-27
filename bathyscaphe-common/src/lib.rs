@@ -1,37 +1,51 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `bathyscaphe-common`: no_std POD types shared between the kernel-side
-//! eBPF programs (`bathyscaphe-ebpf`) and the userspace loader
-//! (`bathyscaphe`).
+//! `bathyscaphe-common`: `no_std`, `repr(C)`, `aya::Pod`-derivable types
+//! shared between the kernel-side eBPF programs (`bathyscaphe-ebpf`,
+//! chunk #4) and the userspace loader/daemon (`bathyscaphe`, chunks
+//! #5-#8). This crate IS the ABI between kernel and user: every public
+//! type here is fixed-size, contains no pointers, and carries no logic
+//! beyond trivial constructors and named constants (rule application,
+//! make-before-break policy swaps, and `Match::is_inert`-style evaluation
+//! belong to the daemon and live in `bathyscaphe` / `bathyscaphe-proto`,
+//! not here).
 //!
-//! This crate is a placeholder for build chunk #1 (scaffold + toolchain
-//! proof). The real map key/value/event structs described in
-//! `bathy_ebpf_design.md` (policy rule entries, the kernel-written event
-//! struct, per-cgroup counters) land in a later build chunk. What's here
-//! now exists only to prove that a `#[repr(C)]`, `aya::Pod`-derivable type
-//! can be shared between the `no_std` eBPF crate and the `std` userspace
-//! crate across the `user` feature boundary.
+//! `bathyscaphe-common` deliberately does not depend on
+//! `bathyscaphe-proto` (a `std` + serde crate) — see `enums.rs` for how
+//! numeric equivalence with the wire protocol's enums is documented
+//! instead of enforced by a shared dependency.
+//!
+//! See `bathy_ebpf_design.md` (the eBPF design brief) for the map/hook
+//! architecture this crate's types implement, and `policy.rs` in
+//! particular for the in-kernel policy map schema — the load-bearing
+//! design decision of this build chunk, flagged there for arbitration.
+//!
+//! ## Module map
+//!
+//! - [`enums`]: shared `repr(u8)` enums (`TransportProto`, `Verdict`,
+//!   `RuleAction`, `RuleSource`, `Mode`, `DefaultVerdict`, `EventType`),
+//!   documented numeric equivalence to `bathyscaphe-proto::common`. Never
+//!   used directly as a map key/value type — see that module's doc for
+//!   why.
+//! - [`policy`]: the in-kernel policy map schema — [`policy::PolicyKeyData`]
+//!   (the `LpmTrie` key's `data` portion), [`policy::PolicyValue`] (the
+//!   `LpmTrie` value), and [`policy::ExactPortKey`] (the flagged
+//!   mitigation type for the "any address, specific port" LPM gap).
+//! - [`enforcement`]: [`enforcement::EnforcementState`], the outer
+//!   per-cgroup map value (mode, default verdict, generation) that gates
+//!   whether a container is enforced at all.
+//! - [`event`]: [`event::Event`], the kernel-written `RingBuf` record.
+//! - [`counters`]: [`counters::TamperCounter`], the per-cgroup
+//!   ring-buffer-drop counter.
 #![no_std]
 
-/// Placeholder POD type. Stands in for the real map value types until the
-/// COMMON crate build chunk lands.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct PlaceholderRecord {
-    pub cgroup_id: u64,
-    pub verdict: u8,
-    pub _pad: [u8; 7],
-}
+pub mod counters;
+pub mod enforcement;
+pub mod enums;
+pub mod event;
+pub mod policy;
 
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for PlaceholderRecord {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_record_is_repr_c_sized() {
-        // u64 + u8 + 7 bytes of padding, no surprise alignment.
-        assert_eq!(core::mem::size_of::<PlaceholderRecord>(), 16);
-    }
-}
+pub use counters::TamperCounter;
+pub use enforcement::EnforcementState;
+pub use enums::{DefaultVerdict, EventType, InvalidDiscriminant, Mode, RuleAction, RuleSource, TransportProto, Verdict};
+pub use event::Event;
+pub use policy::{ExactPortKey, PolicyKeyData, PolicyValue};

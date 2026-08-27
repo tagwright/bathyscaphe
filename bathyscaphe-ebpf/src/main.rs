@@ -14,7 +14,7 @@
 #![no_main]
 
 use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext};
-use bathyscaphe_common::PlaceholderRecord;
+use bathyscaphe_common::Event;
 
 /// Primary enforcement + observation hook (bathy_ebpf_design.md, section
 /// 1a / 6.1). Returning `1` allows the connection; `0` would deny it
@@ -29,10 +29,12 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
 }
 
 fn try_connect4(_ctx: SockAddrContext) -> Result<i32, i32> {
-    // Touch bathyscaphe-common's shared repr(C) type from the kernel side,
-    // proving the same POD type compiles for both the BPF target here and
-    // the host target in userspace. No policy logic yet.
-    let _record = PlaceholderRecord::default();
+    // Touch bathyscaphe-common's shared repr(C) event type from the kernel
+    // side, proving it compiles for both the BPF target here and the host
+    // target in userspace. No RingBuf, no policy lookup yet -- both land
+    // in the EBPF PROGRAMS build chunk, which consumes the map/event
+    // schema this crate's COMMON build chunk defines.
+    let _event = Event::default();
 
     // Always allow. See EBPF PROGRAMS build chunk for the real verdict.
     Ok(1)
