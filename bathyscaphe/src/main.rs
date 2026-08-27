@@ -22,15 +22,21 @@ fn main() {
     println!("bathyscaphe {}", VERSION.trim());
     println!("eBPF object embedded: {} bytes", EBPF_OBJECT.len());
 
-    // Prove bathyscaphe-common and bathyscaphe-proto are wired in and
-    // usable from the userspace binary, even though both are still
-    // placeholder types at this build chunk.
+    // Prove bathyscaphe-common (still placeholder types at this build
+    // chunk) and bathyscaphe-proto (the real, frozen wire protocol as of
+    // the PROTO build chunk) are both wired in and usable from the
+    // userspace binary.
     let _shared_type = bathyscaphe_common::PlaceholderRecord::default();
-    let _wire_type = bathyscaphe_proto::PlaceholderMessage {
-        kind: "toolchain-proof".to_string(),
-        sequence: 0,
+    let hello = bathyscaphe_proto::Hello {
+        backend: "bathyscaphe".to_string(),
+        backend_version: VERSION.trim().to_string(),
+        proto_versions: vec![bathyscaphe_proto::PROTO_VERSION],
+        capabilities: vec![bathyscaphe_proto::Capability::Observe],
+        pinned: Vec::new(),
     };
-    println!("bathyscaphe-common and bathyscaphe-proto skeleton types constructed OK");
+    let _wire_line = bathyscaphe_proto::encode_line(&bathyscaphe_proto::UpMessage::Hello(hello))
+        .expect("hello message encodes");
+    println!("bathyscaphe-common skeleton type and bathyscaphe-proto wire types constructed OK");
 }
 
 /// Stub for the real loader. Not called yet -- see `bathy_ebpf_design.md`

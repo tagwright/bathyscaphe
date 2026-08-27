@@ -1,36 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `bathyscaphe-proto`: the frozen airlock wire protocol types (NDJSON,
-//! one object per line, per `bathy_protocol_draft.md`).
+//! `bathyscaphe-proto`: the frozen airlock wire protocol.
 //!
-//! This crate is a placeholder for build chunk #1 (scaffold + toolchain
-//! proof). The full hello/event/directive/stats/security-record shapes
-//! land in build chunk #2, field-for-field against the protocol draft,
-//! with golden-line tests pinning the frozen wire shapes. What's here now
-//! is a minimal serde round-trip so the toolchain proof covers a std+serde
-//! crate too, not just the no_std side.
+//! NDJSON, one JSON object per line, on two of bathyscaphe's three
+//! standard streams: [`up::UpMessage`] lines on stdout (bathyscaphe ->
+//! airlock), [`down::DownMessage`] lines on stdin (airlock ->
+//! bathyscaphe). stderr carries free-text human logs and is never
+//! parsed; it is not modeled here.
+//!
+//! This crate owns the wire TYPES and the line codec
+//! ([`codec::encode_line`] / [`codec::decode_line`]). It does not own the
+//! I/O loop, the malformed-line counting, the reconciliation state
+//! machine, or the token-bucket throttling of [`security::SecurityRecord`]
+//! lines: those are the userspace daemon's job, built on top of these
+//! types.
+//!
+//! See `docs/PROTOCOL.md` for the full human-readable protocol spec
+//! (framing, handshake, every message and field, the reconciliation
+//! model, the inert-matcher rule, and the security-record mapping to
+//! beacon/bilgeline), and `bathy_protocol_draft.md` in the build
+//! scratchpad for the ratification record this crate implements.
 
-use serde::{Deserialize, Serialize};
+pub mod codec;
+pub mod common;
+pub mod down;
+pub mod security;
+pub mod up;
 
-/// Placeholder wire type. Stands in for `Hello`/`Event`/`Directive`/etc.
-/// until the PROTO crate build chunk lands.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaceholderMessage {
-    pub kind: String,
-    pub sequence: u64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_message_round_trips_through_json() {
-        let original = PlaceholderMessage {
-            kind: "placeholder".to_string(),
-            sequence: 1,
-        };
-        let encoded = serde_json::to_string(&original).expect("serialize");
-        let decoded: PlaceholderMessage = serde_json::from_str(&encoded).expect("deserialize");
-        assert_eq!(original, decoded);
-    }
-}
+pub use codec::{decode_line, encode_line, CodecError, MAX_CONSECUTIVE_MALFORMED_LINES, MAX_LINE_BYTES};
+pub use common::{
+    Capability, Container, DefaultVerdict, Domain, DomainConfidence, DomainSource, Endpoint, EventKind, Mode, Process,
+    Runtime, RuleAction, RuleSource, TransportProto, Verdict, PROTO_VERSION,
+};
+pub use down::{DownMessage, Match, Policy, Release, ReleaseAll, Rule, Shutdown, Start, SyncComplete};
+pub use security::{Severity, SecurityContainer, SecurityRecord};
+pub use up::{
+    AttributeMap, ContainerStats, ErrorMsg, Event, EventMeta, Hello, PinnedContainer, PolicyAck, PolicyAckStatus,
+    ReleaseAck, ReleaseStatus, Stats, UpMessage,
+};
