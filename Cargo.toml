@@ -33,6 +33,11 @@ cargo_metadata = { version = "0.23.0", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 which = { version = "6.0.0", default-features = false }
+# Default features left on (unlike the rest of this table): used only from the
+# std userspace `bathyscaphe` binary (statfs/poll/clock_gettime for the probe
+# loader), never from bathyscaphe-ebpf, so there's no no_std constraint to trim
+# for, and libc's own default feature set is what provides those bindings.
+libc = { version = "0.2" }
 
 [profile.release.package.bathyscaphe-ebpf]
 debug = 2

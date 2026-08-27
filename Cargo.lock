@@ -111,6 +111,7 @@ dependencies = [
  "bathyscaphe-ebpf",
  "bathyscaphe-proto",
  "cargo_metadata",
+ "libc",
 ]
 
 [[package]]

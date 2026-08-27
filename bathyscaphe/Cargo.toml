@@ -9,6 +9,7 @@ bathyscaphe-common = { path = "../bathyscaphe-common", features = ["user"] }
 bathyscaphe-proto = { path = "../bathyscaphe-proto" }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

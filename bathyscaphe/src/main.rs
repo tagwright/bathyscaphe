@@ -10,6 +10,17 @@
 //! reconciliation) is the USERSPACE CORE and DAEMON build chunks in
 //! bathy_build_spec.md's build sequence.
 
+// USERSPACE CORE build chunk: the real loader/attach/pinning/map-API/ringbuf
+// lifecycle. Not wired into `main()` yet -- see `probe`'s module doc. The
+// `load_probe()` stub below predates it and stays as-is (still unused) until
+// the DAEMON build chunk replaces both with the real protocol loop. As a
+// binary crate (no `[lib]` target) nothing outside this crate can reference
+// `probe`'s public API yet either, so the whole module is expected-dead
+// code until that wiring lands -- same rationale as `load_probe`'s own
+// `#[allow(dead_code)]` below.
+#[allow(dead_code, unused_imports)]
+mod probe;
+
 const VERSION: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../VERSION"));
 
 /// The compiled eBPF object for bathyscaphe-ebpf's `connect4` program,
