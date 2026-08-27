@@ -34,6 +34,14 @@ mod attribution;
 #[allow(dead_code, unused_imports)]
 mod pipeline;
 
+// DAEMON + PROTOCOL I/O build chunk: `Daemon::run` is the full
+// hello/start/directive-loop/stats lifecycle over stdin/stdout, built on
+// top of `probe` and `attribution`/`pipeline`. Not wired into `main()`
+// yet -- that is the CLI build chunk's job (a `run` subcommand that reads
+// flags into a `daemon::DaemonConfig` and calls `daemon::Daemon::run`).
+#[allow(dead_code, unused_imports)]
+mod daemon;
+
 const VERSION: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../VERSION"));
 
 /// The compiled eBPF object for bathyscaphe-ebpf's `connect4` program,

@@ -107,6 +107,15 @@ struct Inner {
     /// carries the removed name, not the inode that's already gone by the
     /// time userspace sees the event.
     by_path: HashMap<PathBuf, u64>,
+    /// `container_id -> (cgroup_id, cgroup path)`, for the daemon's
+    /// directive path (build chunk #7): airlock's `policy`/`release`
+    /// directives carry a `container_id`, but the POLICY/ENFORCEMENT/TAMPER
+    /// maps are all keyed by `cgroup_id`, and attaching a not-yet-attached
+    /// container needs its cgroup directory PATH, not just the id. Kept as
+    /// a third index alongside `by_id`/`by_path` rather than derived by
+    /// scanning `by_id` on every directive, since a directive is exactly
+    /// the hot path this index exists for.
+    by_container_id: HashMap<String, (u64, PathBuf)>,
 }
 
 impl CgroupMap {
@@ -118,6 +127,21 @@ impl CgroupMap {
     /// already discovered.
     pub fn get(&self, cgroup_id: u64) -> Option<ContainerRef> {
         self.inner.lock().unwrap_or_else(|poison| poison.into_inner()).by_id.get(&cgroup_id).cloned()
+    }
+
+    /// The reverse direction of [`Self::get`]: `container_id -> cgroup_id`.
+    /// `None` when this process has not (yet) discovered that container's
+    /// cgroup directory -- the daemon's directive path treats this as "not
+    /// attachable yet", not a hard error, since a `policy` directive can
+    /// race a container's cgroup creation.
+    pub fn cgroup_id_for_container(&self, container_id: &str) -> Option<u64> {
+        self.inner.lock().unwrap_or_else(|poison| poison.into_inner()).by_container_id.get(container_id).map(|(id, _)| *id)
+    }
+
+    /// `container_id -> cgroup path`, for [`crate::probe::Probe::attach_container`],
+    /// which needs the directory, not just its inode.
+    pub fn cgroup_path_for_container(&self, container_id: &str) -> Option<PathBuf> {
+        self.inner.lock().unwrap_or_else(|poison| poison.into_inner()).by_container_id.get(container_id).map(|(_, path)| path.clone())
     }
 
     /// The short-lived-container race fallback (`bathy_attribution.md`
@@ -160,10 +184,11 @@ impl CgroupMap {
         self.observe_path(path, meta.ino()).map(|_| meta.ino())
     }
 
-    fn observe_path(&self, path: &Path, cgroup_id: u64) -> Option<ContainerRef> {
+    pub(crate) fn observe_path(&self, path: &Path, cgroup_id: u64) -> Option<ContainerRef> {
         let container_ref = classify_trailing_segment(path)?;
         let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
         inner.by_path.insert(path.to_path_buf(), cgroup_id);
+        inner.by_container_id.insert(container_ref.container_id.clone(), (cgroup_id, path.to_path_buf()));
         inner.by_id.insert(cgroup_id, container_ref.clone());
         Some(container_ref)
     }
@@ -174,7 +199,9 @@ impl CgroupMap {
     fn forget_path(&self, path: &Path) {
         let mut inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(cgroup_id) = inner.by_path.remove(path) {
-            inner.by_id.remove(&cgroup_id);
+            if let Some(container_ref) = inner.by_id.remove(&cgroup_id) {
+                inner.by_container_id.remove(&container_ref.container_id);
+            }
         }
     }
 }
@@ -504,5 +531,27 @@ mod tests {
         let map = CgroupMap::new("/sys/fs/cgroup");
         assert_eq!(map.observe_path(Path::new("/sys/fs/cgroup/system.slice/ssh.service"), 999), None);
         assert_eq!(map.get(999), None);
+    }
+
+    #[test]
+    fn reverse_lookup_resolves_container_id_to_cgroup_id_and_path() {
+        let map = CgroupMap::new("/sys/fs/cgroup");
+        let id = hex(0x88);
+        let path = Path::new("/sys/fs/cgroup/system.slice").join(format!("docker-{id}.scope"));
+        map.observe_path(&path, 424242).expect("a valid docker scope path should classify");
+
+        assert_eq!(map.cgroup_id_for_container(&id), Some(424242));
+        assert_eq!(map.cgroup_path_for_container(&id), Some(path.clone()));
+
+        map.forget_path(&path);
+        assert_eq!(map.cgroup_id_for_container(&id), None);
+        assert_eq!(map.cgroup_path_for_container(&id), None);
+    }
+
+    #[test]
+    fn reverse_lookup_is_none_for_an_unknown_container_id() {
+        let map = CgroupMap::new("/sys/fs/cgroup");
+        assert_eq!(map.cgroup_id_for_container(&hex(0x99)), None);
+        assert_eq!(map.cgroup_path_for_container(&hex(0x99)), None);
     }
 }

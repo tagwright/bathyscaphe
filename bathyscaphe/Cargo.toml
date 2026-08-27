@@ -29,21 +29,21 @@ tokio = { version = "1", default-features = false, features = ["rt", "time", "ma
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # RFC3339 wire timestamps (pipeline::map), converted from the kernel's
 # CLOCK_BOOTTIME `ktime_ns` via a wall-clock offset sampled once at start.
-time = { version = "0.3", default-features = false, features = ["formatting"] }
+# `parsing` and `std` added for the daemon's directive compilation (parsing
+# a rule's `expires_at` RFC3339 string into an absolute CLOCK_BOOTTIME
+# value) and its `security`/`stats` record timestamps (`OffsetDateTime::now_utc`,
+# which needs `std` to read the system clock).
+time = { version = "0.3", default-features = false, features = ["formatting", "parsing", "std"] }
+# The security record's `attributes` map (bathyscaphe_proto::AttributeMap)
+# and stats/hello construction need to build serde_json::Value directly,
+# not just parse Docker API responses in a dev-only test.
+serde_json = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 bathyscaphe-ebpf = { path = "../bathyscaphe-ebpf" }
-
-[dev-dependencies]
-# Parsing the Docker Engine API's JSON response in
-# attribution::resolver::live_smoke's raw setup/teardown client -- proving
-# the resolver against a real container, not exercising a JSON library, so
-# this stays a dev-only dependency rather than something the shipped binary
-# needs.
-serde_json = { workspace = true }
 
 [[bin]]
 name = "bathyscaphe"

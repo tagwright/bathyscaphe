@@ -37,6 +37,48 @@ impl<T: Attributor + ?Sized + Sync> Attributor for Arc<T> {
     }
 }
 
+/// The reverse-direction seam the daemon (build chunk #7) depends on: a
+/// `policy`/`release` directive off the wire carries a `container_id`, but
+/// every kernel map is keyed by `cgroup_id`, and attaching a not-yet-seen
+/// container needs its cgroup PATH. A separate trait from [`Attributor`]
+/// (rather than folding this into it) because the two are used from
+/// different call sites for different reasons -- events flow cgroup_id ->
+/// attribution on the ring-buf consumer thread, directives flow
+/// container_id -> cgroup_id/path on the stdin thread -- and keeping them
+/// separate lets daemon code depend on only the direction it needs, mockable
+/// independently in tests.
+pub trait ContainerLookup: Send + Sync {
+    /// `None` when this process has not (yet) discovered `container_id`'s
+    /// cgroup directory -- a `policy` directive can race a container's
+    /// cgroup creation; the daemon treats this as "not attachable yet", not
+    /// a hard error.
+    fn cgroup_id_for_container(&self, container_id: &str) -> Option<u64>;
+    /// The cgroup directory backing `container_id`, for
+    /// [`crate::probe::Probe::attach_container`]. `None` under the same
+    /// condition as [`Self::cgroup_id_for_container`].
+    fn cgroup_path_for_container(&self, container_id: &str) -> Option<PathBuf>;
+}
+
+impl ContainerLookup for Resolver {
+    fn cgroup_id_for_container(&self, container_id: &str) -> Option<u64> {
+        self.cgroups.cgroup_id_for_container(container_id)
+    }
+
+    fn cgroup_path_for_container(&self, container_id: &str) -> Option<PathBuf> {
+        self.cgroups.cgroup_path_for_container(container_id)
+    }
+}
+
+impl<T: ContainerLookup + ?Sized> ContainerLookup for Arc<T> {
+    fn cgroup_id_for_container(&self, container_id: &str) -> Option<u64> {
+        (**self).cgroup_id_for_container(container_id)
+    }
+
+    fn cgroup_path_for_container(&self, container_id: &str) -> Option<PathBuf> {
+        (**self).cgroup_path_for_container(container_id)
+    }
+}
+
 /// Joins [`CgroupMap`] (deterministic `cgroup_id -> container_id`/`runtime`)
 /// with [`EnrichmentCache`] (best-effort `container_id -> name`/`image`).
 pub struct Resolver {
@@ -118,6 +160,28 @@ mod tests {
         let enrichment = EnrichmentCache::new();
         let resolver = Resolver::new(cgroups, enrichment);
         assert_eq!(resolver.resolve(0xdead_beef), None);
+    }
+
+    #[test]
+    fn container_lookup_reverses_a_discovered_container() {
+        let cgroups = CgroupMap::new("/sys/fs/cgroup");
+        let id = "c".repeat(64);
+        let path = std::path::Path::new("/sys/fs/cgroup/system.slice").join(format!("docker-{id}.scope"));
+        cgroups.observe_path(&path, 0xabc).expect("a valid docker scope path should classify");
+
+        let enrichment = EnrichmentCache::new();
+        let resolver = Resolver::new(cgroups, enrichment);
+
+        assert_eq!(ContainerLookup::cgroup_id_for_container(&resolver, &id), Some(0xabc));
+        assert_eq!(ContainerLookup::cgroup_path_for_container(&resolver, &id), Some(path));
+    }
+
+    #[test]
+    fn container_lookup_is_none_for_an_unknown_container_id() {
+        let cgroups = CgroupMap::new("/sys/fs/cgroup");
+        let enrichment = EnrichmentCache::new();
+        let resolver = Resolver::new(cgroups, enrichment);
+        assert_eq!(ContainerLookup::cgroup_id_for_container(&resolver, "never-seen"), None);
     }
 }
 

@@ -23,4 +23,4 @@ pub mod cgroup;
 pub mod enrich;
 pub mod resolver;
 
-pub use resolver::{Attribution, AttributionService, Attributor, Resolver};
+pub use resolver::{Attribution, AttributionService, Attributor, ContainerLookup, Resolver};

@@ -217,6 +217,44 @@ impl PolicyStore {
     pub fn tracked_container_count(&self) -> usize {
         self.container_keys.len()
     }
+
+    /// Snapshot of every raw `(prefix_len, addr)` key currently tracked for
+    /// `cgroup_id`. The daemon (build chunk #7) uses this to diff a
+    /// container's OLD key set against a freshly compiled directive's NEW
+    /// key set for make-before-break application: insert every new key
+    /// first (via [`Self::set_policy`]), then remove every old key not
+    /// present in the new set (via [`Self::remove_key`]) -- never the
+    /// other order, so a connect never observes a half-applied policy.
+    /// Empty for an unknown or never-tracked `cgroup_id`.
+    pub fn tracked_keys(&self, cgroup_id: u64) -> Vec<(u32, [u8; 16])> {
+        self.container_keys.get(&cgroup_id).map(|set| set.iter().map(|k| (k.prefix_len, k.addr)).collect()).unwrap_or_default()
+    }
+
+    /// Removes exactly one previously-inserted policy entry for
+    /// `cgroup_id`, identified by its raw `(prefix_len, addr)` key (as
+    /// returned by [`Self::tracked_keys`]). Returns whether an entry was
+    /// actually removed -- a key already gone (e.g. reaped by
+    /// [`Self::reap_expired`] first, or removed by a concurrent path) is
+    /// not an error, the same "both paths racing to the same end state"
+    /// tolerance as [`Self::release_container`]. Unlike
+    /// [`Self::release_container`], this drops exactly one key rather than
+    /// every key for the container -- the primitive the daemon's
+    /// make-before-break diff needs.
+    pub fn remove_key(&mut self, cgroup_id: u64, prefix_len: u32, addr: [u8; 16]) -> Result<bool> {
+        let key = Key::new(prefix_len, PolicyKeyData::new(cgroup_id, addr));
+        let removed = match self.trie.remove(&key) {
+            Ok(()) => true,
+            Err(aya::maps::MapError::KeyNotFound) => false,
+            Err(error) => return Err(error).context("POLICY map remove failed during remove_key"),
+        };
+        if let Some(set) = self.container_keys.get_mut(&cgroup_id) {
+            set.remove(&TrackedKey { prefix_len, addr });
+            if set.is_empty() {
+                self.container_keys.remove(&cgroup_id);
+            }
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
