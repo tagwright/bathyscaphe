@@ -947,3 +947,341 @@ Everything chunk #9-#11's own "deferred" notes already listed (TCP DNS,
 IPv6 extension headers, DoH/DoT/ECH, rootless Podman) is unchanged by this
 chunk -- it fixed a capture-length correctness bug, not any of the
 structural visibility gaps those chunks already documented honestly.
+
+## Build chunk #13: end-to-end integration testing
+
+Everything above is either a unit test or a narrow, single-purpose
+privileged smoke test exercising one code path in isolation. This chunk is
+the one the build spec calls "the phase that must not be skipped": drive
+the REAL `bathyscaphe run` binary exactly the way airlock will (a
+subprocess, NDJSON on stdin/stdout, human logs on stderr), against REAL
+throwaway Docker containers making REAL outbound connections, and prove
+the seven priority scenarios from the build brief -- not by reading the
+code and agreeing it looks right, but by actually running it and reading
+what came back.
+
+### Environment this was proven on
+
+Kernel `6.8.0-136-generic`. A long-lived privileged container
+(`bathyscaphe-build-runner`, `rust:1-bookworm`, **deliberately NOT named
+`bathyscaphe-itest-*`** -- see the harness section below for why that
+naming matters) with:
+
+```sh
+docker run -d --name bathyscaphe-build-runner \
+  --privileged --cgroupns=host --pid=host \
+  -v /workspace:/workspace \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  rust:1-bookworm sleep infinity
+docker exec bathyscaphe-build-runner mount -t bpf bpf /sys/fs/bpf
+```
+
+`--cgroupns=host` for the same reason chunk #9's own privileged tests
+document: without it, this container's `/sys/fs/cgroup` is its own private
+namespace slice and never sees the sibling containers this suite creates
+through the bind-mounted Docker socket. The toolchain (nightly + rust-src,
+`bpf-linker` 0.11.0) was installed exactly per `docs/BUILDING.md`; a modern
+static `docker` CLI (27.3.1, from `download.docker.com`'s static builds)
+was added because the `docker.io` apt package's bundled client (20.10) is
+too old to speak this host dockerd's API. `cargo build --release` from
+this container produced `target/release/bathyscaphe`, used throughout.
+
+### The harness: `test/integration/`
+
+- `driver.py` -- the reusable library: `Daemon` (spawns
+  `bathyscaphe run` as a **direct child** of the Python process, never
+  through a nested `docker exec` -- this matters because `Daemon.kill()`
+  must deliver a real `SIGKILL` straight to the actual `bathyscaphe`
+  process for the fail-safe scenario, and a `docker exec` wrapper's own
+  death does not reliably propagate a signal to what it wrapped), NDJSON
+  read/write helpers (`push_policy` with the container-creation-race
+  retry `daemon::apply::resolve_or_attach` documents, `wait_for` a
+  predicate over the `UpMessage` stream with a timeout), rule builders
+  matching `docs/PROTOCOL.md`'s wire shapes verbatim, Docker helpers
+  (`docker_run`/`docker_exec`/`docker_ip`/network create-rm), TCP/UDP
+  connectivity probes, and `nuke_all_itest_objects()` (removes every
+  `bathyscaphe-itest-*` container/network/image).
+- `scenarios.py` -- the seven scenario functions, each self-contained
+  (creates its own `bathyscaphe-itest-*` objects, asserts, cleans up in a
+  `finally`).
+- `run_integration.py` -- the entry point: cleans up stray objects from
+  any previous run, runs the selected scenarios (by number, default all),
+  prints a summary table, cleans up again in a `finally` regardless of
+  outcome.
+
+**How to run it** (inside a privileged container set up as above, working
+directory the repo root):
+
+```sh
+python3 test/integration/run_integration.py            # all seven scenarios
+python3 test/integration/run_integration.py 1 2 3       # a subset, by number
+```
+
+**A real harness bug this chunk's own first run caught, worth recording**:
+the harness's own outer privileged container was originally named
+`bathyscaphe-itest-priv`. `nuke_all_itest_objects()`, running INSIDE that
+same container against the shared Docker socket, matched its own name
+against the `bathyscaphe-itest-*` prefix filter and removed its own
+container out from under itself mid-run, killing the Python process. Fixed
+by renaming the outer driver container to `bathyscaphe-build-runner`
+(anything outside the `bathyscaphe-itest-*` namespace works) -- the
+prefix is reserved exclusively for throwaway objects the suite creates and
+destroys itself, never for the container running the suite.
+
+### Scenario 1 -- OBSERVE parity: PROVEN
+
+Pushed `mode: audit, default: allow, rules: []` for a throwaway alpine
+container, then a TCP connect (`nc -z 1.1.1.1 443`) and a UDP datagram
+(`nc -u 1.1.1.1 53`) from inside it. Both produced an `event` line with
+`verdict: allow`, correct `dst.addr`/`dst.port`, correct `proto`, and
+attribution (`container.id` matching the real Docker container id,
+`container.name` = `bathyscaphe-itest-observe-target`, `container.image`
+containing `alpine`, `container.runtime: docker`) that matched the real
+container exactly.
+
+### Scenario 2 -- IN-KERNEL DROP: PROVEN (the make-or-break test)
+
+Pushed `mode: block, default: deny` with two allow rules
+(`1.1.1.1/32:443/tcp`, `1.1.1.1/32:53/udp`) for a throwaway container.
+Connecting to the allowed destination succeeded
+(`nc -z 1.1.1.1 443` -> exit 0, 0.07s); connecting to a disallowed
+destination (`nc -z 8.8.8.8 443`, covered by no rule, falls to
+`default: deny`) failed in **0.05 seconds** -- an in-kernel `EPERM` at
+`connect()` time, not a network timeout (a real timeout with `-w 3` would
+take ~3s). The `event` stream showed exactly the expected pair: `verdict:
+allow` for `1.1.1.1:443`, `verdict: deny` for `8.8.8.8:443`, both correctly
+attributed to the container. This is the literal reason bathyscaphe
+exists, and it holds.
+
+### Scenario 3 -- FAIL-SAFE ON PROBE DEATH: PROVEN (the security-critical guarantee)
+
+Own dedicated bpffs root. Sequence, every step verified against real
+`nc` connects, not inferred:
+
+1. Fresh daemon, `hello.pinned == []` (confirmed cold start).
+2. Pushed `mode: block, default: deny` + one allow rule. Baseline: allowed
+   destination succeeds, disallowed destination denied.
+3. `SIGKILL` the real `bathyscaphe` process (a direct child, confirmed
+   dead via `proc.poll()`).
+4. **With zero bathyscaphe process running anywhere**: the allowed
+   destination still connects, the disallowed destination is still
+   denied. Kernel-pinned enforcement survives probe death completely.
+5. Started a second `bathyscaphe run` against the SAME bpffs root.
+   `hello.pinned` reported the surviving container (correct `container_id`,
+   `mode: block`) without a fresh policy push -- reopened from pins, not
+   reloaded. Enforcement (allow + deny) still held identically after the
+   restart.
+6. Killed the second daemon, ran the standalone break-glass
+   `bathyscaphe unpin --all --bpffs-root ...`. Confirmed the whole pin
+   subtree was removed from the filesystem.
+7. The **previously-denied** destination now connects successfully:
+   enforcement is completely cleared, with no running probe and no
+   airlock involved at any point in this step.
+
+### Scenario 4 -- FQDN ALLOW: PROVEN
+
+User-defined bridge network (Docker's embedded resolver at `127.0.0.11`,
+which the default trusted-resolver set trusts). Pushed a `type: name`
+allow rule for a sibling container's own Docker DNS name (port/proto
+constrained), plus an explicit CIDR allow for `127.0.0.11:53/udp` (see
+"A real gotcha" below for why that second rule is required). Before any
+DNS answer was observed, connecting directly to the backend's IP was
+denied (proves the eventual allow really comes from the DNS-seeded route,
+not a coincidental match). `nslookup <name>.` resolved correctly via
+`127.0.0.11`; within a few seconds the same IP:port started connecting
+successfully. An unrelated destination stayed denied throughout
+(`default: deny` still holds for everything the name rule didn't cover).
+
+### Scenario 5 -- FQDN DENY: PROVEN
+
+Same shape, `mode: block, default: allow`, one `type: name` DENY rule.
+Before the DNS answer, the backend's bare IP connected fine (nothing to
+deny yet). After `nslookup`, the same IP:port started failing. An
+unrelated destination (`default: allow`) kept working the whole time.
+
+### Scenario 6 -- UNTRUSTED RESOLVER: PROVEN (in its own daemon session -- see the escalated finding below)
+
+A throwaway `dnsmasq` container (`address=/#/<forbidden-ip>`, answering
+EVERY query with a fixed RFC 5737 TEST-NET-3 address) on the same
+user-defined network as the target. Docker's `--dns <ip>` flag was tried
+first and found NOT to work for this purpose (see "A real test-setup
+gotcha" below) -- the target's `/etc/resolv.conf` was rewritten directly
+after container start to point straight at the rogue container's own IP,
+bypassing Docker's embedded-resolver relay entirely. With a `type: name`
+ALLOW rule matching the queried domain: the rogue resolver's answer
+carried the forbidden IP (confirmed in the client's own `nslookup`
+output), a `security` record with `reason: dns.untrusted_answer` and
+`attributes["resolver.addr"]` equal to the rogue container's real IP
+fired, and the forbidden IP stayed denied throughout (before the query,
+immediately after, and 3 seconds later) -- the allow-map was never seeded
+from it, even though the name pattern matched.
+
+### Scenario 7 -- RECONCILIATION: PROVEN
+
+Own dedicated bpffs root. Pushed policy for a container, killed the
+daemon, started a fresh one against the same root. `hello.pinned` reported
+the container. Deliberately sent `sync_complete` WITHOUT re-pushing policy
+for it (simulating airlock's reconciliation pass covering every other
+container but this one). The next `stats` message reported this
+container's entry with `orphaned: true`, `enforcing: true`,
+`mode: "block"` -- and a live connect to the previously-denied destination
+confirmed enforcement was still actually armed in the kernel, not just
+reported as such.
+
+### Bugs and gotchas found, precisely
+
+**1. A real design-level finding, ESCALATED (not fixed here): the DNS
+query/response correlation table is a single global `(txid, dst_port)`
+map shared across every container in one daemon process, and its own
+collision-safety argument does not hold in a multi-container host.**
+
+`bathyscaphe/src/dns/pending.rs`'s module doc argues a `(txid, port)`
+collision across two different containers is "possible in principle but
+exceedingly unlikely," reasoning that "the OS kernel's own port allocator
+guarantees" a container's ephemeral source port is unique among its own
+in-flight queries. That reasoning is true WITHIN one network namespace,
+but each Docker container has its OWN network namespace with its OWN
+independently-reset ephemeral port allocator -- two different containers'
+first-ever UDP sockets are actually quite likely to land on the same low
+ephemeral port, and busybox/musl's DNS transaction id generation is not
+necessarily strongly random either. `crate::dns::capture_callback`
+(`bathyscaphe/src/dns/mod.rs`) makes this worse than the module doc's own
+worst case by ALWAYS preferring a correlation-table hit over the
+response's own (frequently already-correct) capture attribution, with no
+"does this actually disagree" check and no scoping by resolver address or
+any other disambiguator.
+
+**Repro, live, deterministic**: run scenario 4 then scenario 5 (each
+generates several real DNS round trips, `daemon.release()`s its container
+at the end -- which clears that container's `NamePatternStore`
+registration but does NOT clear its now-stale `PendingQueryTable` entries,
+which age out only on their own 5-second TTL) then scenario 6 (a container
+that queries a resolver DIRECTLY, with no injection/relay in the way, so
+its response capture's own `cgroup_id` attribution is already correct and
+needs no correlation at all) **in the same daemon process**: 5/5 repeats
+reproduced a silently-missing `dns.untrusted_answer` record (the query
+resolved correctly client-side every time -- confirmed in `nslookup`'s own
+output -- but bathyscaphe's `on_dns_answer` never fired for it). 0/5
+failures running scenario 6 standalone, or after scenarios that generate
+no DNS traffic (1, 2, 3, 7). The mechanism, read directly from the code:
+a stale `(txid, port)` entry left over from an already-finished,
+already-`release`d scenario-4/5 container coincidentally matched this
+scenario's own `(txid, port)`; `capture_callback` used that stale, WRONG
+cgroup id in place of the response capture's own correct one;
+`on_dns_answer` looked up name patterns for that wrong (and by then
+un-registered) cgroup id, found none, and reported nothing.
+
+**Why this matters beyond one flaky test**: the same unconditional
+override, in `mode: block`, is the path that inserts a `POLICY` host route
+into a container's kernel enforcement map
+(`daemon::fqdn::on_dns_answer` -> `insert_host_route` ->
+`ProbeApi::set_policy`). A `(txid, port)` collision between two
+DIFFERENT, presently-live containers -- not just a stale-entry accident
+like this repro, which needed no adversary at all -- would let container
+A's own DNS query/response traffic seed a host route into container B's
+enforcement map, if B has an active name-allow pattern the colliding
+answer happens to match. Given ephemeral ports reset per-namespace and a
+16-bit transaction id, this reads as a more practically exploitable
+collision surface than the module doc's own "exceedingly unlikely"
+framing assumes, in exactly the containerized multi-tenant setting this
+tool is built for. This is squarely a design decision (should the table
+be scoped per-container, keyed with the resolver address as the build
+brief's own draft allowed for, or should a correlation hit only override
+the capture's own attribution when the two actually disagree) rather than
+a small, obviously-correct fix, so it is reported here for arbitration
+rather than changed unilaterally. The harness sidesteps it for its own
+purposes by giving scenario 6 a dedicated, freshly-started daemon (an
+empty correlation table has nothing stale to collide with) -- this proves
+scenario 6's own claim cleanly, but does NOT paper over or fix the
+underlying finding.
+
+**2. Not a bug -- a design property worth stating plainly for the next
+operator who hits it: under `default: deny`, the DNS query itself needs an
+explicit allow rule.** bathyscaphe applies the exact same enforcement to a
+container's outbound DNS query (ordinary UDP:53 egress) as to any other
+traffic -- there is no built-in exemption. The first version of scenarios
+4 and 6 omitted an explicit allow for the resolver and got `nslookup:
+can't connect to remote host (127.0.0.11): Operation not permitted` --
+the udp sendmsg hook correctly denying the query before it ever reached
+the resolver. This is the right call (a magic always-allow-port-53 carve-out
+would itself be an exfiltration channel and a policy hole -- the exact
+kind of silent widening `bathy_build_spec.md` rules out elsewhere), and is
+exactly analogous to how any default-deny egress firewall (iptables,
+Cilium, a Kubernetes `NetworkPolicy`) needs an explicit DNS allow rule.
+Worth a line in the README or an operator-facing doc since it is easy to
+be surprised by on a first `mode: block` + name-rule deployment; not
+something this testing chunk changes on its own authority.
+
+**3. A real Docker behavior, not a bathyscaphe issue, that shaped how
+scenario 6 had to be built: `docker run --dns <ip>` does not make a
+container's query leave addressed to that IP.** Verified live: even with
+`--dns` given, the container's own `/etc/resolv.conf` still names
+`127.0.0.11` as its nameserver, and Docker's embedded resolver PROXIES the
+query to the given address itself (visible in `resolv.conf`'s own
+`# ExtServers: [...]` comment) and relays the answer back into the
+container's network namespace. `dns_snoop`'s ingress hook would then
+capture the RELAYED answer's source as `127.0.0.11` (trusted by default),
+which would have made the "untrusted resolver" scenario accidentally test
+the TRUSTED path instead. Fixed by rewriting `/etc/resolv.conf` directly
+inside the target container after it starts, which bypasses Docker's
+proxy substitution entirely and makes the query genuinely leave addressed
+at the rogue container's own IP.
+
+**4. A harness-only mistake, fixed before any scenario ran for real (see
+above)**: the outer privileged driver container's own name matched the
+`bathyscaphe-itest-*` cleanup prefix and was removed by its own cleanup
+routine mid-run. Renamed; not a product issue.
+
+### Honest coverage table
+
+| # | Scenario | Status | Evidence |
+|---|---|---|---|
+| 1 | Observe parity | **PROVEN** | real `event` lines, correct verdict/attribution, against a real container |
+| 2 | In-kernel drop | **PROVEN** | real EPERM at connect() time (0.05s), real allow/deny events |
+| 3 | Fail-safe on probe death | **PROVEN** | SIGKILL, no-userspace enforcement, resumed-boot enforcement, break-glass clear, all against real connects |
+| 4 | FQDN allow | **PROVEN** | real Docker embedded-DNS resolution, real host-route seeding, real connect before/after |
+| 5 | FQDN deny | **PROVEN** | same, deny direction |
+| 6 | Untrusted resolver | **PROVEN** | real rogue resolver, real forbidden-IP answer, real `dns.untrusted_answer` record, real continued denial |
+| 7 | Reconciliation/orphan | **PROVEN** | real restart, real `hello.pinned`, real `orphaned: true` + continued enforcement |
+
+All seven of the build brief's priority scenarios are PROVEN, not partial
+and not deferred. Nothing was skipped as "environmentally impossible" in
+this environment.
+
+### Cleanup
+
+Every `bathyscaphe-itest-*` container, network, and image is removed by
+`nuke_all_itest_objects()` at both the start and end of every
+`run_integration.py` invocation, and by each scenario's own `finally`
+block as it finishes. Verified after two full back-to-back suite runs:
+`docker ps -a`, `docker network ls` show zero `bathyscaphe-itest-*`
+entries, and `/sys/fs/bpf` (this container's own bpffs mount) is empty.
+The outer `bathyscaphe-build-runner` container and its toolchain are not
+itest objects and are left running for reuse; nothing outside this
+container's own namespaces (the real host, the "real" running stack) was
+touched at any point.
+
+### What this chunk does NOT cover (honestly deferred, not silently skipped)
+
+- **Rootless Podman**: unchanged from chunks #6-#12's own honest gap --
+  this environment is Docker-only.
+- **TCP-fallback DNS, IPv6 DNS traffic, DoH/DoT/ECH**: unchanged
+  structural gaps `docs/DNS.md` already documents; this chunk's job was
+  the seven priority scenarios, not re-litigating already-documented
+  visibility limits.
+- **R2 (opt-in fail-closed-on-sustained-drops)**: not exercised live in
+  this chunk -- forcing a sustained ring-buffer drop rate on demand (as
+  opposed to a single probe kill) was judged out of this chunk's
+  timebox given the seven priority scenarios above were the mandate;
+  `daemon::r2`'s own unit tests already cover the escalation logic in
+  isolation.
+- **Packaging (#14)**: this chunk built and ran against
+  `target/release/bathyscaphe` directly, never through the eventual
+  packaged Docker image -- `docs/BUILDING.md`'s two-toolchain recipe is
+  still the only proven build path, not yet wrapped in a Dockerfile.
+- **README accuracy (#15)**: the top-level README's status line still
+  says "under construction, past scaffold... Not yet built: the DNS-snoop
+  FQDN layer" -- stale as of chunks #8-#12, which built exactly that
+  layer through and its FQDN enforcement, now proven end to end by this
+  chunk. Left as-is here since README accuracy is explicitly build chunk
+  #15's job, not this one's, but flagged so it isn't missed.

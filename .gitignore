@@ -13,6 +13,11 @@
 .env
 *.local
 
+# The integration test harness (test/integration/) is plain Python, run
+# in place, never packaged -- its own bytecode cache never belongs here.
+__pycache__/
+*.pyc
+
 # bpffs pin paths never belong in the repo, but guard against someone
 # accidentally dumping a debug copy in-tree
 /pinned/
