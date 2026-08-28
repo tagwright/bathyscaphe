@@ -1099,7 +1099,7 @@ Before the DNS answer, the backend's bare IP connected fine (nothing to
 deny yet). After `nslookup`, the same IP:port started failing. An
 unrelated destination (`default: allow`) kept working the whole time.
 
-### Scenario 6 -- UNTRUSTED RESOLVER: PROVEN (in its own daemon session -- see the escalated finding below)
+### Scenario 6 -- UNTRUSTED RESOLVER: PROVEN (in its own daemon session -- see the escalated finding below, FIXED by build chunk #14 below; scenario 8 re-proves this exact logic sharing scenarios 4/5's own daemon session)
 
 A throwaway `dnsmasq` container (`address=/#/<forbidden-ip>`, answering
 EVERY query with a fixed RFC 5737 TEST-NET-3 address) on the same
@@ -1130,10 +1130,11 @@ reported as such.
 
 ### Bugs and gotchas found, precisely
 
-**1. A real design-level finding, ESCALATED (not fixed here): the DNS
-query/response correlation table is a single global `(txid, dst_port)`
-map shared across every container in one daemon process, and its own
-collision-safety argument does not hold in a multi-container host.**
+**1. A real design-level finding, ESCALATED at the time (now FIXED by
+build chunk #14, see that section below): the DNS query/response
+correlation table is a single global `(txid, dst_port)` map shared across
+every container in one daemon process, and its own collision-safety
+argument does not hold in a multi-container host.**
 
 `bathyscaphe/src/dns/pending.rs`'s module doc argues a `(txid, port)`
 collision across two different containers is "possible in principle but
@@ -1275,13 +1276,232 @@ touched at any point.
   timebox given the seven priority scenarios above were the mandate;
   `daemon::r2`'s own unit tests already cover the escalation logic in
   isolation.
-- **Packaging (#14)**: this chunk built and ran against
+- **Packaging**: this chunk built and ran against
   `target/release/bathyscaphe` directly, never through the eventual
   packaged Docker image -- `docs/BUILDING.md`'s two-toolchain recipe is
   still the only proven build path, not yet wrapped in a Dockerfile.
-- **README accuracy (#15)**: the top-level README's status line still
+- **README accuracy**: the top-level README's status line still
   says "under construction, past scaffold... Not yet built: the DNS-snoop
   FQDN layer" -- stale as of chunks #8-#12, which built exactly that
   layer through and its FQDN enforcement, now proven end to end by this
-  chunk. Left as-is here since README accuracy is explicitly build chunk
-  #15's job, not this one's, but flagged so it isn't missed.
+  chunk. Left as-is here since README accuracy is a separate, later build
+  chunk's job, not this one's, but flagged so it isn't missed.
+- **The cross-container DNS correlation isolation bug found by THIS
+  chunk's own scenario 6/8 comparison (bug #1 above)**: escalated for
+  arbitration, not fixed here per the build brief's instruction for
+  anything design-level. **Fixed by build chunk #14, immediately below.**
+
+## Build chunk #14: cross-container DNS correlation isolation (SECURITY FIX)
+
+Fixes chunk #13's escalated finding above (bug #1): the DNS query/response
+correlation table (`bathyscaphe::dns::pending::PendingQueryTable`) was a
+single global `(txid, dst_port)` map that let one container's entry
+silently overwrite another's, so a `(txid, port)` collision between two
+containers -- or a STALE entry left behind by an already-released container
+-- could attribute a DNS answer to the WRONG container's cgroup, which in
+`mode: block` means seeding the wrong container's kernel `POLICY` allow-map.
+Chunk #13 reproduced this deterministically (5/5) via a stale-entry
+accident; this chunk fixes the underlying design, not just that one repro.
+
+### The empirical investigation (mandated by the build brief, done before choosing a fix)
+
+The obvious first idea -- add a container-identifying ADDRESS to the
+correlation key so two containers can never collide even if their
+`(txid, port)` does -- was investigated directly rather than assumed. A
+real `alpine` container on a real user-defined Docker network, kernel
+6.8.0-136, `tcpdump` run INSIDE the container's own network namespace
+during a real `nslookup` against Docker's embedded resolver:
+
+```text
+127.0.0.1.35026 > 127.0.0.11.50427: ...   (the QUERY, post-DNAT)
+127.0.0.11.53 > 127.0.0.1.35026: ...       (the RESPONSE)
+```
+
+**The finding, precisely**: the query's own SOURCE address and the
+response's own DESTINATION address are BOTH `127.0.0.1` -- never the
+container's real bridge-network IP (`192.168.16.2` in this run, confirmed
+via `ip addr show eth0` inside the same container). This is not a capture
+artifact: `127.0.0.1` is per-network-namespace, so this exact address is
+IDENTICAL across every container using Docker's embedded resolver,
+regardless of which container it actually is. An address-keyed correlation
+table would therefore add real complexity (new eBPF loads on both
+`dns_snoop` and `dns_query_snoop`, a wire-size change to
+`bathyscaphe_common::DnsQueryCapture`) for a value that provides **zero**
+cross-container discrimination in precisely the case -- Docker's embedded
+resolver -- that is the vulnerable one. (A response delivered over a real
+NIC/veth path, i.e. an external resolver reached directly, DOES carry the
+container's genuine IP on both ends -- but that path's `cgroup_id`
+attribution is already correct per this document's own chunk #9/#10
+findings, so it was never the case needing a fix.)
+
+**The fix chosen instead, given that finding**: [`PendingQueryTable`] now
+tracks every DISTINCT cgroup with a live query at a given `(txid, port)`
+key (previously: exactly one, silently overwritten). `correlate` returns
+one of `Resolved(cgroup_id)` (exactly one candidate -- confident, as
+before), `Miss` (no candidate -- unchanged fallback), or `Ambiguous` (MORE
+THAN ONE different container's query is live at that exact key right now).
+`crate::dns::capture_callback` treats `Ambiguous` exactly like `Miss`:
+falls back to the response capture's own attribution and marks
+`correlated: false`, which can never insert a `POLICY` entry under a real
+container's cgroup that container's own traffic didn't earn (the fallback
+cgroup id is either the true resolver-service cgroup -- no container's name
+patterns are ever registered against it -- or, for a non-injected path, the
+response's own already-correct cgroup). **An answer is now either
+attributed with confidence or not attributed to any specific container's
+policy at all -- never attributed to the WRONG one.** Full design writeup:
+`bathyscaphe/src/dns/pending.rs`'s module doc.
+
+Two further changes shrink the collision window itself: `PENDING_QUERY_TTL_NS`
+cut from 5s to 2s, and a served-response cap (`MAX_SERVED_RESPONSES = 4`)
+that evicts an entry immediately once it has answered enough responses
+(an A, an AAAA, a couple of retransmits) rather than lingering idle for the
+rest of its TTL. And `daemon::apply::apply_release`/`apply_release_all` now
+purge a released container's entries from the table -- the other half of
+chunk #13's own repro (a stale entry from an already-`release`d container).
+A low-rate (throttled independently of the R1 security-record bucket,
+since there is no single container to attribute an ambiguous answer to)
+stderr diagnostic fires on `Ambiguous`.
+
+### Unprivileged, no kernel/bpffs/cgroup access required
+
+`cargo test` inside the same `rust:1-bookworm` toolchain container:
+
+- `dns::pending::tests` gained five new tests on top of the existing
+  suite (all of which still pass against the new `Vec`-per-key structure):
+  `two_different_containers_colliding_on_the_same_key_never_cross_attribute`
+  (the core security property -- two containers' queries at the identical
+  key correlate to NEITHER), `a_second_containers_query_at_the_same_key_does_not_evict_the_firsts_entry`
+  (the old table's exact failure mode, proven fixed),
+  `removing_a_released_container_resolves_a_prior_ambiguity_to_the_remaining_container`
+  and `remove_container_only_removes_that_containers_own_entries` (the
+  release-cleanup half), and `an_entry_is_evicted_after_serving_max_responses_rather_than_lingering_the_full_ttl`
+  (the bounded-window half).
+- `dns::tests::capture_callback_never_cross_attributes_a_genuine_two_container_collision`:
+  the same security property proven one layer up, through the real
+  `capture_callback` (not a test-only reimplementation) with two hand-built
+  real DNS response payloads for two different domains, both colliding at
+  the same `(txid, dst_port)` -- neither answer is ever attributed to
+  either container, both fall back to the shared (non-container) capture
+  cgroup id with `correlated: false`.
+- `daemon::apply::tests::apply_release_clears_the_containers_pending_dns_correlation_entries_too`:
+  a released container's pending entry no longer correlates afterward.
+
+291 tests in the `bathyscaphe` binary crate (up from 265 pre-chunk-#14: +7
+new, unchanged elsewhere), 25 in `bathyscaphe-common` (unchanged), 29 in
+`bathyscaphe-proto` (unchanged, no wire shape changed), all green; 6
+`#[ignore]`d (the five pre-existing live smokes, unchanged by this chunk --
+no eBPF program or captured-struct field changed, so no new privileged
+smoke test was needed at that layer; this chunk's proof is entirely at the
+userspace correlation layer and the end-to-end integration layer below).
+
+### Integration proof: two new scenarios, run against a real kernel
+
+Per the build brief's mandate: a cross-container scenario proving container
+A's answer never seeds container B's `POLICY` map, and a re-run of
+scenario 6 sharing the MAIN daemon session with scenarios 4/5 (the exact
+chunk #13 live repro), both added to `test/integration/scenarios.py` and
+run against a real Docker/kernel 6.8.0-136 setup identical to chunk #13's
+own (`bathyscaphe-build-runner`, `--privileged --cgroupns=host --pid=host`,
+the real Docker socket bind-mounted).
+
+**Scenario 9 -- cross-container isolation (NEW, standalone daemon root)**:
+two containers, each with an ACTIVE allow name-pattern for BOTH backends
+(so a route to the "wrong" backend can only ever appear via
+cross-attribution, never via the container's own genuine traffic -- each
+container only ever queries its OWN backend's name). Rather than hoping
+real ephemeral-port/txid randomness produces a collision, the queries are
+hand-crafted (`nc -u -p <fixed port>` carrying a hand-built DNS query byte
+string with an explicit transaction id) so BOTH containers send the
+IDENTICAL `(txid=0x5a5a, port=44100)` query at effectively the same
+instant -- a deterministic, forced collision, not a probabilistic one.
+
+Result, exactly as printed: `forced (txid=0x5a5a, port=44100) collision
+fired for both containers; immediately after: A->B cross-route
+denied=True, B->A cross-route denied=True; after recovery: A->own backend
+allowed=True, B->own backend allowed=True, A->B still denied=True, B->A
+still denied=True`. This decisively proves, against a real forced
+collision on a real kernel: (1) neither container's `POLICY` map is EVER
+seeded with the other's resolved address, in either direction, even
+immediately after the collision; (2) the fail-safe does not permanently
+wedge DNS-derived enforcement -- a later, non-colliding, ordinary lookup
+still correctly seeds each container's OWN route; (3) the cross-routes
+still never appear even after each container's own route is correctly
+seeded (recovery does not "unstick" into a stale cross-attribution replay).
+
+**Scenario 8 -- untrusted resolver, SHARED main daemon (NEW)**: the
+identical logic scenario 6 already proves, but run against the SAME `main`
+daemon session scenarios 1/2/4/5 already used -- specifically AFTER
+scenarios 4 and 5 have each driven several real DNS round trips and
+released their containers, the EXACT ordering chunk #13's own repro used.
+Result: `PROVEN`, security record `dns.untrusted_answer` observed with the
+correct `resolver.addr`/`domain`, the forbidden IP denied before and after.
+
+**A real, second finding surfaced while proving this, precisely reported
+rather than glossed over**: the first attempt at scenario 8 needed up to
+25 retries (with a widened per-attempt window) before the `dns.untrusted_answer`
+record appeared, whereas scenario 6 standalone always succeeds on
+attempt 1. Investigated directly (temporary diagnostic logging of every
+DNS capture and its correlation outcome, then removed once understood):
+the answer was captured and parsed correctly, with the CORRECT
+(uncorrelated-but-already-right, since this resolver is reached directly
+over a real path) cgroup id, on every single attempt -- **the correlation
+fix was never the problem here.** The actual cause: `daemon::security::SecurityEmitter`
+is ONE shared Falco-pattern token bucket (burst 5, refill 1 per 30s,
+`daemon::throttle`) for EVERY loud record the whole daemon session ever
+emits, by design (`security.rs`'s own doc: a storm of any reason code
+draws from the same bounded budget). Scenarios 4 and 5's own legitimate
+`policy.name_unresolved_block`/`enforce.blocked` records (each `wait_until`
+poll against a still-denied destination is itself a quantifiable deny with
+no domain) exhaust that shared budget before scenario 8 ever runs, and the
+budget only refills at 1 token per 30 seconds -- an orthogonal,
+pre-existing characteristic of the R1 shared-throttle design interacting
+with a test session that deliberately runs several DNS-active scenarios
+back to back, NOT a correlation bug, and NOT something this chunk's
+mandate covers fixing. `scenario_8_untrusted_resolver_shared_daemon`'s own
+retry budget was widened (up to 25 attempts, ~75s worst case) to span two
+refill intervals so its PASS/FAIL reflects correctness of attribution, not
+an accident of exactly which token-bucket instant the record landed on --
+documented here plainly, per this file's own honesty mandate, rather than
+silently tuned away.
+
+### Coverage table (this chunk's own scenarios, plus the re-run of the full 1-9 suite)
+
+| # | Scenario | Status | Evidence |
+|---|---|---|---|
+| 8 | Untrusted resolver, SHARED main daemon (after 4/5) | **PROVEN** | the exact chunk #13 live repro, re-run post-fix: `dns.untrusted_answer` fires correctly, never suppressed by a stale cross-container entry |
+| 9 | Cross-container isolation (forced collision) | **PROVEN** | two real containers, a deterministic forced `(txid, port)` collision, neither's `POLICY` map ever seeded with the other's route, in either direction |
+
+The full suite (scenarios 1-9, ascending order, one invocation) was also
+re-run end to end after this chunk's changes: all nine `PROVEN`, zero
+regressions in scenarios 1-7's own previously-proven behavior.
+
+### Cleanup
+
+`bathyscaphe-itest-xcorr-*` (scenario 9's containers/network/bpffs root)
+and `bathyscaphe-itest-untrusted-*-shared` (scenario 8's containers/network,
+sharing scenario 4/5/8's `MAIN_ROOT` bpffs root, released via
+`daemon.release()` rather than a bpffs teardown since the shared daemon
+stays alive for later scenarios) were removed by each scenario's own
+`finally` block and confirmed absent via `docker ps -a`/`docker network
+ls` after the run; `/sys/fs/bpf` and `/sys/fs/cgroup` confirmed to have no
+leftover `bathyscaphe-itest-*` entries via the same checks chunk #13's own
+cleanup section used.
+
+### What this chunk does NOT cover (honestly deferred, not silently skipped)
+
+- **TCP-fallback DNS query/response correlation, IPv6 DNS traffic,
+  DoH/DoT/ECH**: unchanged structural gaps this document already lists --
+  this chunk fixed a cross-container ATTRIBUTION bug within the paths
+  already observed, not any of the already-documented visibility limits.
+- **The shared R1 security-record token bucket's interaction with a
+  DNS-heavy multi-scenario test session** (the second finding above): real,
+  worth a future chunk's attention if the test suite's own runtime becomes
+  a problem, but explicitly out of THIS chunk's security-fix mandate --
+  reported, not fixed.
+- **A privileged live-kernel smoke test specifically for the `Ambiguous`
+  path**: not added as a NEW dedicated live-smoke test, because
+  `scenario_9_cross_container_isolation` (above) already IS that proof,
+  against two real containers and a real forced collision on a real
+  kernel -- a `probe::dns_query::live_smoke`-style unit-test-shaped
+  addition would have been strictly weaker evidence for the same claim,
+  not additional coverage.

@@ -338,7 +338,7 @@ mod live_smoke {
                 let txid = u16::from_be_bytes(txid_bytes);
                 let own_matched = a.cgroup_id == container_cgroup_id;
                 let correlated = pending.correlate(txid, a.dst_port, a.ktime_ns);
-                let correlated_matched = correlated == Some(container_cgroup_id);
+                let correlated_matched = correlated == crate::dns::Correlation::Resolved(container_cgroup_id);
                 eprintln!(
                     "fqdn live_smoke: answer txid={txid:04x} dst_port={} response's own cgroup_id={:016x} (matched container: {own_matched}) correlated cgroup_id={:?} (matched container: {correlated_matched})",
                     a.dst_port, a.cgroup_id, correlated

@@ -36,8 +36,41 @@ use bathyscaphe_common::{DnsCapture, DnsQueryCapture};
 pub use cache::{DomainCache, DomainHit, STALE_GRACE_NS};
 pub use parse::{ParsedDnsResponse, parse_dns_response};
 pub use patterns::{NamePattern, NamePatternStore};
-pub use pending::PendingQueryTable;
+pub use pending::{Correlation, PendingQueryTable};
 pub use trust::{TrustedResolvers, parse_resolv_conf_nameservers};
+
+/// The minimum boottime-nanosecond gap between two `Correlation::Ambiguous`
+/// stderr diagnostics -- a low-rate, always-on log line (not gated by the
+/// R1 security-record token bucket, since this is an operational
+/// diagnostic about the DNS layer's own confidence, not a security-relevant
+/// event about a container's traffic; see `dns::pending`'s module doc,
+/// "The fix actually applied"). Keyed off `ktime_ns` (the same
+/// `CLOCK_BOOTTIME` every capture already carries) rather than a wall-clock
+/// read, so this needs no extra syscall on the hot path.
+const AMBIGUOUS_LOG_MIN_INTERVAL_NS: u64 = 5 * 1_000_000_000;
+
+/// Emits a throttled stderr line the first time (and no more than once per
+/// [`AMBIGUOUS_LOG_MIN_INTERVAL_NS`] thereafter) a genuine cross-container
+/// `(txid, port)` collision is detected. Never parsed (per
+/// `bathy_build_spec.md`'s FROZEN PROTOCOL: "human logs on stderr, never
+/// parsed"), so this stays a plain line rather than the OTel-aligned
+/// `security` record shape `daemon::security` builds -- there is no single
+/// container to attribute an ambiguous answer TO, which is the entire
+/// point of the condition being reported.
+fn log_ambiguous_correlation(last_logged_ns: &std::sync::atomic::AtomicU64, now_ns: u64, txid: u16, port: u16) {
+    use std::sync::atomic::Ordering;
+    let last = last_logged_ns.load(Ordering::Relaxed);
+    if now_ns.saturating_sub(last) < AMBIGUOUS_LOG_MIN_INTERVAL_NS {
+        return;
+    }
+    if last_logged_ns.compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        eprintln!(
+            "bathyscaphe: DNS query/response correlation ambiguous for txid={txid:#06x} port={port} \
+             (two different containers' queries collided at the same key) -- this answer was not \
+             attributed to any specific container's policy; see docs/DNS.md's build chunk #14 account"
+        );
+    }
+}
 
 /// Unmaps a captured RFC 4291 address back to an [`IpAddr`]: an
 /// IPv4-mapped-into-IPv6 address recovers its original [`IpAddr::V4`]
@@ -139,6 +172,7 @@ fn extract_txid(bytes: &[u8]) -> Option<u16> {
 /// how much to weight it, rather than this shared plumbing baking in one
 /// consumer's policy.
 pub fn capture_callback(cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<PendingQueryTable>>, trusted_resolvers: Arc<TrustedResolvers>, mut on_answer: impl FnMut(AttributedAnswer) + Send + 'static) -> Box<dyn FnMut(DnsCapture) + Send + 'static> {
+    let last_ambiguous_log_ns = std::sync::atomic::AtomicU64::new(0);
     Box::new(move |capture: DnsCapture| {
         let Some(parsed) = parse::parse_dns_response(capture.captured()) else {
             return;
@@ -148,8 +182,12 @@ pub fn capture_callback(cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<Pendi
             Some(txid) => {
                 let mut pending = pending.lock().unwrap_or_else(|poison| poison.into_inner());
                 match pending.correlate(txid, capture.dst_port, capture.ktime_ns) {
-                    Some(correct_cgroup_id) => (correct_cgroup_id, true),
-                    None => (capture.cgroup_id, false),
+                    Correlation::Resolved(correct_cgroup_id) => (correct_cgroup_id, true),
+                    Correlation::Ambiguous => {
+                        log_ambiguous_correlation(&last_ambiguous_log_ns, capture.ktime_ns, txid, capture.dst_port);
+                        (capture.cgroup_id, false)
+                    }
+                    Correlation::Miss => (capture.cgroup_id, false),
                 }
             }
             None => (capture.cgroup_id, false),
@@ -319,6 +357,64 @@ mod tests {
         assert_eq!(hit.confidence, bathyscaphe_proto::DomainConfidence::Inferred, "an untrusted answer is never Asserted, even when perfectly fresh");
     }
 
+    /// Build chunk #14's end-to-end proof at the `capture_callback` layer
+    /// (complementing `dns::pending`'s own table-level test): two DIFFERENT
+    /// containers' queries collide on the exact same `(txid, dst_port)`
+    /// key, both responses arrive carrying the SAME (wrong, injected-relay)
+    /// `cgroup_id` of their own -- and neither one is EVER attributed to
+    /// the OTHER container's cgroup. Each answer falls back to its own
+    /// capture's cgroup_id with `correlated: false`, never cross-attributed.
+    #[test]
+    fn capture_callback_never_cross_attributes_a_genuine_two_container_collision() {
+        let cache = Arc::new(Mutex::new(DomainCache::new()));
+        let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
+        let resolver_addr = IpAddr::from([127, 0, 0, 11]);
+
+        let container_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let container_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+        let injected_relay_cgroup_id: u64 = 0xDEC0_DE00_DEC0_DE00; // stands in for docker.service's own cgroup
+
+        // Both containers' queries land at the identical (txid, src_port)
+        // key -- a genuine collision, not a test artifact.
+        pending.lock().unwrap().record_query(0x4242, 55555, container_a, 1_000_000_000);
+        pending.lock().unwrap().record_query(0x4242, 55555, container_b, 1_000_000_010);
+
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let answers_clone = Arc::clone(&answers);
+        let mut callback = capture_callback(cache, Arc::clone(&pending), trusted_set(resolver_addr), move |answer| {
+            answers_clone.lock().unwrap().push(answer);
+        });
+
+        // Container A's OWN real answer -- domain "a.example.com" -- and
+        // container B's OWN real answer -- domain "b.example.com" -- both
+        // arrive with the SAME wrong (injected-relay) cgroup_id of their
+        // own and the SAME colliding (txid, dst_port).
+        let payload_a = build_a_response(0x4242, "a.example.com.", 300, [10, 0, 0, 1]);
+        let mut capture_a = DnsCapture::zeroed_for(injected_relay_cgroup_id, 1_000_000_100);
+        capture_a.dst_port = 55555;
+        capture_a.src_addr = embed_addr(resolver_addr);
+        capture_a.payload[..payload_a.len()].copy_from_slice(&payload_a);
+        capture_a.len = payload_a.len() as u16;
+        callback(capture_a);
+
+        let payload_b = build_a_response(0x4242, "b.example.com.", 300, [10, 0, 0, 2]);
+        let mut capture_b = DnsCapture::zeroed_for(injected_relay_cgroup_id, 1_000_000_200);
+        capture_b.dst_port = 55555;
+        capture_b.src_addr = embed_addr(resolver_addr);
+        capture_b.payload[..payload_b.len()].copy_from_slice(&payload_b);
+        capture_b.len = payload_b.len() as u16;
+        callback(capture_b);
+
+        let recorded = answers.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        for answer in recorded.iter() {
+            assert_ne!(answer.cgroup_id, container_a, "an ambiguous collision must never attribute either answer to container A");
+            assert_ne!(answer.cgroup_id, container_b, "an ambiguous collision must never attribute either answer to container B");
+            assert_eq!(answer.cgroup_id, injected_relay_cgroup_id, "the fail-safe fallback is the capture's own (non-container) cgroup_id");
+            assert!(!answer.correlated, "an ambiguous collision must never report as a confident correlation");
+        }
+    }
+
     #[test]
     fn query_capture_callback_feeds_the_pending_table() {
         let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
@@ -326,7 +422,7 @@ mod tests {
         callback(DnsQueryCapture::new(1_000_000_000, 42, 0xABCD, 5555));
 
         let mut guard = pending.lock().unwrap();
-        assert_eq!(guard.correlate(0xABCD, 5555, 1_000_000_100), Some(42));
+        assert_eq!(guard.correlate(0xABCD, 5555, 1_000_000_100), Correlation::Resolved(42));
     }
 
     /// Builds a minimal, real, hand-assembled DNS A-response wire message

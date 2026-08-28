@@ -268,7 +268,7 @@ impl Daemon {
         let stats_shutdown = Arc::new(AtomicBool::new(false));
         let stats_handle = spawn_stats_thread(Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&security), tx.clone(), Arc::clone(&stats_shutdown), events_emitted, denies_since_last, config.r2, stats_interval_s);
 
-        let outcome = run_directive_loop(stdin.lock(), Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&name_rules), tx.clone(), boot_offset_ns);
+        let outcome = run_directive_loop(stdin.lock(), Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&name_rules), Arc::clone(&pending), tx.clone(), boot_offset_ns);
 
         // Shutdown, in dependency order. Deliberately no probe mutation
         // anywhere in this sequence -- see the module doc.
@@ -362,7 +362,17 @@ fn spawn_stats_thread(
 
 /// Runs the stdin directive loop on the calling (main) thread, dispatching
 /// every non-`shutdown` directive against the shared probe/state.
-fn run_directive_loop(stdin_lock: std::io::StdinLock<'_>, shared_probe: Arc<Mutex<Probe>>, shared_state: Arc<Mutex<DaemonState>>, resolver: Arc<crate::attribution::Resolver>, name_rules: Arc<Mutex<NamePatternStore>>, sink: mpsc::Sender<UpMessage>, boot_offset_ns: i128) -> stdin::StdinOutcome {
+#[allow(clippy::too_many_arguments)]
+fn run_directive_loop(
+    stdin_lock: std::io::StdinLock<'_>,
+    shared_probe: Arc<Mutex<Probe>>,
+    shared_state: Arc<Mutex<DaemonState>>,
+    resolver: Arc<crate::attribution::Resolver>,
+    name_rules: Arc<Mutex<NamePatternStore>>,
+    pending: Arc<Mutex<PendingQueryTable>>,
+    sink: mpsc::Sender<UpMessage>,
+    boot_offset_ns: i128,
+) -> stdin::StdinOutcome {
     let mut sink = sink;
     stdin::run(stdin_lock, move |message| {
         let mut probe_guard = shared_probe.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -377,11 +387,11 @@ fn run_directive_loop(stdin_lock: std::io::StdinLock<'_>, shared_probe: Arc<Mute
                 sink.emit(UpMessage::PolicyAck(ack));
             }
             DownMessage::Release(release) => {
-                let ack = apply::apply_release(&mut *probe_guard, &mut *state_guard, resolver.as_ref(), &name_rules, &release.container_id);
+                let ack = apply::apply_release(&mut *probe_guard, &mut *state_guard, resolver.as_ref(), &name_rules, &pending, &release.container_id);
                 sink.emit(UpMessage::ReleaseAck(ack));
             }
             DownMessage::ReleaseAll(_) => {
-                for ack in apply::apply_release_all(&mut *probe_guard, &mut *state_guard, &name_rules) {
+                for ack in apply::apply_release_all(&mut *probe_guard, &mut *state_guard, &name_rules, &pending) {
                     sink.emit(UpMessage::ReleaseAck(ack));
                 }
             }

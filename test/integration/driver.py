@@ -230,6 +230,14 @@ def docker_exec(name: str, *cmd: str, timeout: float = 15.0) -> subprocess.Compl
     return subprocess.run(["docker", "exec", name, *cmd], capture_output=True, text=True, timeout=timeout)
 
 
+def docker_exec_stdin(name: str, cmd: list[str], input_bytes: bytes, timeout: float = 15.0) -> subprocess.CompletedProcess:
+    """Like `docker_exec`, but feeds `input_bytes` to the command's stdin
+    and returns raw (not text-decoded) stdout/stderr -- used to hand a
+    hand-crafted binary DNS query to `nc` without going through a shell
+    quoting layer."""
+    return subprocess.run(["docker", "exec", "-i", name, *cmd], input=input_bytes, capture_output=True, timeout=timeout)
+
+
 def docker_rm(name: str) -> None:
     subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
 

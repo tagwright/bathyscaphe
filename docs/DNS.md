@@ -316,16 +316,21 @@ inserted_at}`; every captured response looks up `(txid, dst_port)` -- the
 response's destination port IS the original query's source port, since
 that is where the resolver addresses its reply -- and, on a hit, recovers
 the CORRECT cgroup id, overriding the response hook's own attribution.
-`PENDING_QUERY_TTL_NS` is 5 seconds (comfortably longer than any real
-resolver round trip, short enough that an unanswered query does not
-linger); sweeping is opportunistic (mirrors `DomainCache`'s own
-sweep-on-every-write convention), and a correlated entry is NOT removed on
-its first match, so more than one response datagram for the same query
-(a duplicate/retransmit, or separate A/AAAA answers reusing the same
-transaction id and port) all still correlate. The correlation key is
+`PENDING_QUERY_TTL_NS` was 5 seconds at chunk #10 (cut to 2 seconds by
+build chunk #14, see "Build chunk #14" below); sweeping is opportunistic
+(mirrors `DomainCache`'s own sweep-on-every-write convention), and a
+correlated entry is NOT removed on its first match, so more than one
+response datagram for the same query (a duplicate/retransmit, or separate
+A/AAAA answers reusing the same transaction id and port) all still
+correlate (bounded, as of chunk #14, to `MAX_SERVED_RESPONSES` per entry
+rather than lingering the rest of the TTL). The correlation key is
 `(txid, port)` only, deliberately without a resolver-address component --
-see that module's doc for the documented, judged-acceptable residual risk
-this simplification carries.
+chunk #10 judged the cross-container collision risk this carries
+"exceedingly unlikely"; **chunk #13's live integration testing proved that
+judgment wrong** (a real, deterministic 5/5 collision), and **chunk #14
+fixed the underlying design** -- see "Build chunk #14: cross-container
+isolation" below for the empirical investigation into why an
+address-based key was NOT the fix, and what was built instead.
 
 **The uncorrelatable fallback**: `crate::dns::capture_callback` falls back
 to the response capture's OWN `cgroup_id` whenever no matching query was
@@ -854,7 +859,7 @@ none of chunk #9's tiered-length machinery (or this chunk's replacement)
 ever applied to it. Confirmed unchanged in this chunk;
 `bathyscaphe-ebpf/src/dns_query.rs` was not touched.
 
-## Full residual limitation list (chunks #9-#12, honest and complete)
+## Full residual limitation list (chunks #9-#14, honest and complete)
 
 IP/CIDR policy is the ground-truth floor throughout; every limitation
 below describes when FQDN enforcement's best-effort layer has nothing to
@@ -878,13 +883,20 @@ add, never a case where IP/CIDR enforcement itself is compromised.
   cgroup_id, low-confidence**: documented above (`AttributedAnswer::correlated`);
   the cache and enforcement pipeline still function, using the same
   attribution chunk #9 shipped.
-- **The correlation key omits a resolver-address component**: `(txid,
-  port)` only, not `(txid, port, resolver_addr)` -- see
-  `bathyscaphe::dns::pending`'s module doc for the judged-acceptable
-  collision risk this accepts (an ephemeral-port collision between two
-  DIFFERENT containers' concurrent queries, within the same 5-second
-  window, with the same 16-bit transaction id) in exchange for not
-  needing to plumb an extra field through `DnsCapture`.
+- **The correlation key is STILL `(txid, port)` only, no resolver-address
+  component -- but a collision at that key can no longer cross-attribute
+  (FIXED by build chunk #14)**: chunk #10 judged an address-based key
+  unnecessary; chunk #13's live testing proved a real collision reaches
+  the key deterministically more easily than assumed. Chunk #14
+  investigated adding an address component empirically and found it does
+  NOT work for the vulnerable case (see "Build chunk #14" below) --
+  instead, the table now detects when more than one container's query is
+  live at the same key and refuses to attribute the answer to either one,
+  rather than silently picking (possibly wrongly) as before. The residual
+  that remains: a genuine collision still means NEITHER colliding
+  container's answer gets used for enforcement during the overlap (a
+  fail-safe availability cost, bounded by the now-shorter 2-second TTL),
+  never that the wrong container's policy gets seeded.
 - **The Docker-embedded-DNS address special-case is Docker-specific**:
   `dns_query_snoop` recognizes `127.0.0.11` by address as a NAT-invariant
   signal (see the empirical-investigation section above). A different
@@ -920,3 +932,103 @@ add, never a case where IP/CIDR enforcement itself is compromised.
   the other two documented ways a container can evade name-rule policy
   entirely, with IP/CIDR staying the hard floor beneath all three, exactly
   as `bathy_build_spec.md`'s BUILD-THROUGH STANCE requires.
+
+## Build chunk #14: cross-container DNS correlation isolation (SECURITY FIX)
+
+Chunk #13's live integration testing escalated a real finding (`docs/TESTING.md`'s
+own "Build chunk #13" section, bug #1): the query/response correlation
+table (`bathyscaphe::dns::pending::PendingQueryTable`) was a single global
+`(txid, dst_port)` map, and a second container's query at the same key
+silently OVERWROTE the first's still-live entry -- reproduced deterministically
+(5/5) via a stale entry left behind by an already-`release`d container.
+This is squarely a security-relevant bug: in `mode: block`, the same
+unconditional preference for a correlation-table hit is what seeds a
+container's kernel `POLICY` allow-map, so a collision could in principle
+attribute one container's DNS answer to a DIFFERENT container's
+enforcement map.
+
+### The empirical question this chunk had to answer first
+
+Before choosing a fix, the build brief mandated investigating directly
+whether a container-identifying ADDRESS (the query's own source address,
+or the response's own destination address) could disambiguate two
+colliding containers, since that would be the "obvious" fix. Investigated
+against a real `alpine` container on a real user-defined Docker network,
+kernel 6.8.0-136, with `tcpdump` run INSIDE the container's own network
+namespace during a real `nslookup` against Docker's embedded resolver:
+
+```text
+127.0.0.1.35026 > 127.0.0.11.50427: ...   (the QUERY, as observed on the container's own lo)
+127.0.0.11.53 > 127.0.0.1.35026: ...       (the RESPONSE)
+```
+
+**Finding**: the query's own source address and the response's own
+destination address are BOTH `127.0.0.1` -- the container's real
+bridge-network IP (confirmed separately as `192.168.16.2` via `ip addr
+show eth0` in the same container) never appears on either side of this
+exchange at all. This is not a fluke of one run: `127.0.0.1` is
+per-network-namespace, and Docker's embedded resolver delivers its answer
+via an injected loopback exchange entirely inside the querying container's
+own netns (the actual upstream resolution happens elsewhere and is relayed
+in) -- so this exact byte pattern is IDENTICAL across every container
+using the embedded resolver, regardless of which one it is. **An
+address-based correlation key would have added real complexity (new eBPF
+loads on `dns_snoop`/`dns_query_snoop`, a wire-size change to
+`DnsQueryCapture`) for zero discriminating power in exactly the case that
+needed fixing.** (For a response reached over a REAL NIC/veth path -- an
+external resolver -- the address genuinely would be the container's own;
+but that path's `cgroup_id` attribution is already correct per "Why
+ingress" above, so it was never the vulnerable case.)
+
+### The fix actually built
+
+Given that finding, build chunk #14 did NOT add an address component.
+Instead, `PendingQueryTable` now tracks every DISTINCT cgroup with a live
+query at a `(txid, port)` key (previously: one, silently overwritten), and
+`correlate` returns `Resolved(cgroup_id)` only when EXACTLY one candidate
+is live; `Ambiguous` when more than one different container's query
+collides at that exact key; `Miss` when none do. `crate::dns::capture_callback`
+treats `Ambiguous` exactly like `Miss` -- falls back to the response
+capture's own attribution, `correlated: false` -- which can never insert a
+`POLICY` entry under a real container's cgroup that container's own
+traffic didn't earn. **An answer is now either attributed with confidence
+or not attributed to any specific container's policy at all -- never
+attributed to the WRONG one.** Full derivation:
+`bathyscaphe/src/dns/pending.rs`'s module doc.
+
+Three more changes close the rest of chunk #13's own finding:
+
+- **Release cleanup**: `daemon::apply::apply_release`/`apply_release_all`
+  now purge a released container's entries from the table
+  (`PendingQueryTable::remove_container`) -- the stale-entry half of the
+  chunk #13 repro. A released container can no longer be the ghost a later
+  container's query collides with.
+- **A bounded collision window**: `PENDING_QUERY_TTL_NS` cut from 5s to 2s,
+  and a served-response cap (`MAX_SERVED_RESPONSES = 4`) evicts an entry
+  immediately once it has answered enough responses rather than lingering
+  idle for the rest of its TTL, shrinking how long two containers' queries
+  can ever be concurrently live at the same key.
+- **A low-rate diagnostic**: `crate::dns::log_ambiguous_correlation` emits
+  a throttled (independent of the R1 security-record bucket, since there
+  is no single container to attribute an ambiguous answer to) stderr line
+  the first time a genuine collision is detected, and no more than once
+  per 5 boottime-seconds thereafter.
+
+### Proof
+
+`dns::pending::tests::two_different_containers_colliding_on_the_same_key_never_cross_attribute`
+and `dns::tests::capture_callback_never_cross_attributes_a_genuine_two_container_collision`
+prove the property without a kernel. Two NEW integration scenarios prove
+it against a real kernel: `test/integration/scenarios.py`'s
+`scenario_9_cross_container_isolation` forces a DETERMINISTIC `(txid,
+port)` collision between two real containers (hand-crafted DNS queries
+over `nc -u -p <fixed port>`, not hoping for a natural collision) and
+proves neither's `POLICY` map is ever seeded with the other's route, in
+either direction, and that the fix self-heals once the collision clears;
+`scenario_8_untrusted_resolver_shared_daemon` re-runs scenario 6's exact
+logic sharing scenarios 4/5's own daemon session -- the precise chunk #13
+live repro -- and proves it PROVEN, not silently suppressed. Full account,
+including a second, orthogonal finding this proof surfaced (the R1 shared
+security-record token bucket needing a real refill interval when several
+DNS-active scenarios share one daemon session -- not a correlation bug):
+`docs/TESTING.md`'s "Build chunk #14" section.

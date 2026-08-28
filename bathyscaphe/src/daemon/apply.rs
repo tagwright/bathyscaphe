@@ -23,7 +23,7 @@ use bathyscaphe_proto::down::Policy;
 use bathyscaphe_proto::{PolicyAck, PolicyAckStatus, ReleaseAck, ReleaseStatus};
 
 use crate::attribution::ContainerLookup;
-use crate::dns::{NamePattern, NamePatternStore};
+use crate::dns::{NamePattern, NamePatternStore, PendingQueryTable};
 
 use super::compile::{self, CompiledPolicy};
 use super::probe_api::ProbeApi;
@@ -164,12 +164,21 @@ pub fn apply_policy(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &
 /// Drops enforcement for one container back to observe-only, keeping the
 /// attach hooks in place. Idempotent: a container this process never knew
 /// about (or already released) still acks `released`.
-pub fn apply_release(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &dyn ContainerLookup, name_rules: &Mutex<NamePatternStore>, container_id: &str) -> ReleaseAck {
+///
+/// Build chunk #14: also purges this container's entries from the DNS
+/// query/response correlation table (`pending`). This is the "cleanup on
+/// release" half of the cross-container isolation fix
+/// (`crate::dns::pending`'s module doc, "Cleanup on release"): without it,
+/// a released container's still-live pending query is exactly the STALE
+/// entry chunk #13's live repro found a later, unrelated container's query
+/// colliding with.
+pub fn apply_release(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &dyn ContainerLookup, name_rules: &Mutex<NamePatternStore>, pending: &Mutex<PendingQueryTable>, container_id: &str) -> ReleaseAck {
     let cgroup_id = lookup.cgroup_id_for_container(container_id).or_else(|| state.containers.get(container_id).map(|c| c.cgroup_id));
     if let Some(cgroup_id) = cgroup_id {
         let _ = probe.clear_enforcement(cgroup_id);
         let _ = probe.release_policy_container(cgroup_id);
         name_rules.lock().unwrap_or_else(|poison| poison.into_inner()).remove_container(cgroup_id);
+        pending.lock().unwrap_or_else(|poison| poison.into_inner()).remove_container(cgroup_id);
     }
     state.remove(container_id);
     ReleaseAck { container_id: container_id.to_string(), status: ReleaseStatus::Released }
@@ -177,8 +186,8 @@ pub fn apply_release(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: 
 
 /// The host-level emergency variant: releases every container this
 /// process currently holds policy state for, acking one `release_ack`
-/// each.
-pub fn apply_release_all(probe: &mut dyn ProbeApi, state: &mut DaemonState, name_rules: &Mutex<NamePatternStore>) -> Vec<ReleaseAck> {
+/// each. See [`apply_release`]'s doc for why `pending` is purged here too.
+pub fn apply_release_all(probe: &mut dyn ProbeApi, state: &mut DaemonState, name_rules: &Mutex<NamePatternStore>, pending: &Mutex<PendingQueryTable>) -> Vec<ReleaseAck> {
     let container_ids: Vec<String> = state.containers.keys().cloned().collect();
     let mut acks = Vec::with_capacity(container_ids.len());
     for container_id in container_ids {
@@ -186,6 +195,7 @@ pub fn apply_release_all(probe: &mut dyn ProbeApi, state: &mut DaemonState, name
             let _ = probe.clear_enforcement(cgroup_id);
             let _ = probe.release_policy_container(cgroup_id);
             name_rules.lock().unwrap_or_else(|poison| poison.into_inner()).remove_container(cgroup_id);
+            pending.lock().unwrap_or_else(|poison| poison.into_inner()).remove_container(cgroup_id);
         }
         state.remove(&container_id);
         acks.push(ReleaseAck { container_id, status: ReleaseStatus::Released });
@@ -229,6 +239,10 @@ mod tests {
 
     fn empty_name_rules() -> Mutex<NamePatternStore> {
         Mutex::new(NamePatternStore::new())
+    }
+
+    fn empty_pending() -> Mutex<PendingQueryTable> {
+        Mutex::new(PendingQueryTable::new())
     }
 
     #[test]
@@ -438,10 +452,11 @@ mod tests {
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
 
+        let pending = empty_pending();
         let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("10.0.0.0/8", WireAction::Allow)] };
         apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
 
-        let ack = apply_release(&mut probe, &mut state, &lookup, &name_rules, &container_id());
+        let ack = apply_release(&mut probe, &mut state, &lookup, &name_rules, &pending, &container_id());
         assert_eq!(ack.status, ReleaseStatus::Released);
         assert!(!state.containers.contains_key(&container_id()));
         assert!(probe.get_enforcement(21).unwrap().is_none());
@@ -455,14 +470,47 @@ mod tests {
         let lookup = lookup_with_one_container(22);
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
+        let pending = empty_pending();
 
         let name_rule = Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown: Default::default() }, expires_at: None, source: WireSource::Static };
         let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Alert, default: WireDefault::Allow, rules: vec![name_rule] };
         apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
         assert!(name_rules.lock().unwrap().has_active_allow_pattern(22));
 
-        apply_release(&mut probe, &mut state, &lookup, &name_rules, &container_id());
+        apply_release(&mut probe, &mut state, &lookup, &name_rules, &pending, &container_id());
         assert!(!name_rules.lock().unwrap().has_active_allow_pattern(22), "release must clear the container's registered name patterns");
+    }
+
+    /// Build chunk #14: releasing a container must purge its entries from
+    /// the DNS query/response correlation table too -- otherwise the
+    /// released container's stale entry is exactly what a later, unrelated
+    /// container's colliding query would still find (`docs/TESTING.md`'s
+    /// chunk #13 live repro; `crate::dns::pending`'s module doc, "Cleanup
+    /// on release").
+    #[test]
+    fn apply_release_clears_the_containers_pending_dns_correlation_entries_too() {
+        use crate::dns::Correlation;
+
+        let mut probe = MockProbe::new();
+        let lookup = lookup_with_one_container(23);
+        let mut state = DaemonState::new();
+        let name_rules = empty_name_rules();
+        let pending = empty_pending();
+
+        let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![] };
+        apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
+
+        pending.lock().unwrap().record_query(0x1234, 55555, 23, 0);
+        assert_eq!(pending.lock().unwrap().correlate(0x1234, 55555, 1), Correlation::Resolved(23));
+
+        // Re-record it (correlate() above may have consumed part of its
+        // serve budget) so the release-clears-it assertion below is
+        // unambiguous either way.
+        pending.lock().unwrap().record_query(0x1234, 55555, 23, 2);
+
+        apply_release(&mut probe, &mut state, &lookup, &name_rules, &pending, &container_id());
+
+        assert_eq!(pending.lock().unwrap().correlate(0x1234, 55555, 3), Correlation::Miss, "a released container's pending query must not linger to collide with a later, unrelated container");
     }
 
     #[test]
@@ -471,7 +519,8 @@ mod tests {
         let lookup = StubLookup { id_to_cgroup: std::collections::HashMap::new() };
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
-        let ack = apply_release(&mut probe, &mut state, &lookup, &name_rules, "never-seen");
+        let pending = empty_pending();
+        let ack = apply_release(&mut probe, &mut state, &lookup, &name_rules, &pending, "never-seen");
         assert_eq!(ack.status, ReleaseStatus::Released);
         assert!(probe.calls.is_empty());
     }
@@ -482,12 +531,13 @@ mod tests {
         let lookup1 = lookup_with_one_container(31);
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
+        let pending = empty_pending();
 
         let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![] };
         apply_policy(&mut probe, &mut state, &lookup1, &name_rules, 0, &policy);
         assert_eq!(state.containers.len(), 1);
 
-        let acks = apply_release_all(&mut probe, &mut state, &name_rules);
+        let acks = apply_release_all(&mut probe, &mut state, &name_rules, &pending);
         assert_eq!(acks.len(), 1);
         assert_eq!(acks[0].status, ReleaseStatus::Released);
         assert!(state.containers.is_empty());

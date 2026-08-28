@@ -29,6 +29,14 @@ SCENARIOS = {
     5: ("5_fqdn_deny", "needs_main_daemon"),
     6: ("6_untrusted_resolver", "standalone"),
     7: ("7_reconciliation", "standalone"),
+    # Build chunk #14 (cross-container DNS correlation isolation fix):
+    # scenario 8 deliberately needs the MAIN daemon and, run in the default
+    # ascending order, executes AFTER scenarios 4 and 5 have already driven
+    # several real DNS round trips through that SAME daemon session -- see
+    # `scenario_8_untrusted_resolver_shared_daemon`'s own doc for why that
+    # ordering is the whole point (it is the exact chunk #13 live repro).
+    8: ("8_untrusted_resolver_shared_daemon", "needs_main_daemon"),
+    9: ("9_cross_container_isolation", "standalone"),
 }
 
 
@@ -63,6 +71,10 @@ def run_selected(numbers: list[int]) -> list[ScenarioResult]:
                     result = S.scenario_6_untrusted_resolver()
                 elif n == 7:
                     result = S.scenario_7_reconciliation()
+                elif n == 8:
+                    result = S.scenario_8_untrusted_resolver_shared_daemon(get_main_daemon())
+                elif n == 9:
+                    result = S.scenario_9_cross_container_isolation()
                 else:
                     raise ValueError(f"unknown scenario number {n}")
             except AssertionError as error:

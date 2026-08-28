@@ -12,7 +12,9 @@ actually proved."""
 from __future__ import annotations
 
 import os
+import struct
 import subprocess
+import threading
 import time
 
 from driver import (
@@ -20,6 +22,7 @@ from driver import (
     ScenarioResult,
     cidr_rule,
     docker_exec,
+    docker_exec_stdin,
     docker_id,
     docker_ip,
     docker_rm,
@@ -38,6 +41,20 @@ MAIN_ROOT = "/sys/fs/bpf/bathyscaphe-itest-main"
 FAILSAFE_ROOT = "/sys/fs/bpf/bathyscaphe-itest-failsafe"
 RECONCILE_ROOT = "/sys/fs/bpf/bathyscaphe-itest-reconcile"
 UNTRUSTED_ROOT = "/sys/fs/bpf/bathyscaphe-itest-untrusted"
+XCORR_ROOT = "/sys/fs/bpf/bathyscaphe-itest-xcorr"
+
+
+def _build_dns_a_query(txid: int, qname: str) -> bytes:
+    """Hand-crafts a minimal, valid DNS query (one question, type A, class
+    IN) with an EXPLICIT transaction id -- used by
+    `scenario_9_cross_container_isolation` to FORCE a `(txid, port)`
+    collision between two different containers deterministically, rather
+    than hoping for one to occur naturally."""
+    header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)  # flags: RD set
+    labels = [label for label in qname.split(".") if label]
+    encoded_name = b"".join(bytes([len(label)]) + label.encode("ascii") for label in labels) + b"\x00"
+    question = encoded_name + struct.pack(">HH", 1, 1)  # QTYPE=A, QCLASS=IN
+    return header + question
 
 
 def scenario_1_observe(daemon: Daemon) -> ScenarioResult:
@@ -290,57 +307,24 @@ def scenario_5_fqdn_deny(daemon: Daemon) -> ScenarioResult:
         network_rm(net)
 
 
-def scenario_6_untrusted_resolver() -> ScenarioResult:
-    # NOTE: this scenario runs against its OWN dedicated daemon/bpffs root
-    # (UNTRUSTED_ROOT), NOT the shared MAIN daemon scenarios 1/2/4/5 use.
-    # This is deliberate, not incidental: `crate::dns::pending::PendingQueryTable`
-    # (the query/response correlation table `daemon::Daemon::run` shares
-    # across every container in one process) is a GLOBAL table keyed only
-    # by `(txid, dst_port)`, swept on a 5-second TTL, and its own module
-    # doc's collision-safety argument ("the OS kernel's own port allocator
-    # guarantees uniqueness ... for a single querying process/socket") does
-    # not hold across DIFFERENT containers: each container gets its OWN
-    # network namespace with its OWN independently-reset ephemeral port
-    # allocator, so two different containers' first-ever UDP sockets are
-    # actually quite likely to pick the SAME low ephemeral port, and
-    # busybox/musl's DNS transaction id generation is not necessarily
-    # strongly random either. Running this suite's scenarios 4 and 5
-    # (each doing several DNS round trips) immediately before this one, in
-    # the SAME daemon session, was found LIVE to reproduce exactly this: a
-    # stale `(txid, port)` entry left over from an already-finished,
-    # already-`release`d scenario-4/5 container collided with this
-    # scenario's own query, `capture_callback` (`crate::dns::mod::capture_callback`)
-    # UNCONDITIONALLY preferred the (stale, wrong) correlated cgroup_id
-    # over the response capture's own (already-correct, since this
-    # scenario's resolver is reached directly with no injection/relay in
-    # the way) cgroup_id, `on_dns_answer` looked up name patterns for that
-    # wrong, already-`release`d cgroup id (none registered any more), and
-    # the `dns.untrusted_answer` record silently never fired -- 5/5
-    # repeats after running scenarios 4+5 first, 0/5 failures running
-    # standalone or after scenarios that do not touch DNS. This is a real
-    # design-level finding (see docs/TESTING.md and the final report for
-    # the full account) escalated rather than fixed here, per the build
-    # brief's instruction for anything design-level. Isolating this
-    # scenario in its own daemon/bpffs root sidesteps it for THIS harness's
-    # own purposes (a fresh process starts with an empty correlation
-    # table) without masking or working around the underlying issue.
-    root = UNTRUSTED_ROOT
-    net = "bathyscaphe-itest-untrusted-net"
-    rogue = "bathyscaphe-itest-untrusted-rogue"
-    target = "bathyscaphe-itest-untrusted-target"
+def _untrusted_resolver_flow(daemon: Daemon, scenario_name: str, suffix: str) -> ScenarioResult:
+    """Shared body for scenario 6 (its own dedicated daemon) and scenario 8
+    (the shared MAIN daemon, deliberately run AFTER scenarios 4 and 5 in the
+    same process -- see `scenario_8_untrusted_resolver_shared_daemon`'s own
+    doc for why). `suffix` keeps each caller's Docker objects from
+    colliding when both run in the same suite invocation."""
+    net = f"bathyscaphe-itest-untrusted-net{suffix}"
+    rogue = f"bathyscaphe-itest-untrusted-rogue{suffix}"
+    target = f"bathyscaphe-itest-untrusted-target{suffix}"
     forbidden_ip = "203.0.113.7"  # TEST-NET-3 (RFC 5737): documentation-only, never a real destination.
     domain = "allowed.itest.internal"
-    subprocess.run(["rm", "-rf", root])
     network_rm(net)
     docker_rm(rogue)
     docker_rm(target)
     network_create(net)
     docker_run(rogue, network=net, cmd=["sh", "-c", f"apk add --no-cache dnsmasq >/tmp/apk.log 2>&1 && exec dnsmasq --no-daemon --no-resolv --no-hosts --address=/#/{forbidden_ip} --log-queries"])
     cid = None
-    daemon = None
     try:
-        daemon = Daemon(root, stats_interval_s=1)
-        daemon.handshake()
         rogue_ready = wait_until(lambda: subprocess.run(["docker", "exec", rogue, "pgrep", "dnsmasq"], capture_output=True).returncode == 0, timeout=30, interval=1)
         assert rogue_ready, "the rogue dnsmasq resolver never started (apk install or dnsmasq startup failed)"
         rogue_ip = docker_ip(rogue, net)
@@ -392,10 +376,32 @@ def scenario_6_untrusted_resolver() -> ScenarioResult:
         # bathyscaphe's own passive capture of that same answer occasionally
         # is, so this retries the query rather than treating one missed
         # capture as a scenario failure.
+        #
+        # A SECOND reason this needs real retry budget when `daemon` is the
+        # SHARED main daemon (`scenario_8_untrusted_resolver_shared_daemon`):
+        # `daemon::security::SecurityEmitter` is ONE shared Falco-pattern
+        # token bucket (burst 5, refill 1/30s, `daemon::throttle`) for EVERY
+        # loud record this whole daemon session ever emits, by design
+        # (`docs/DNS.md`/`security.rs`'s own doc: a storm of ANY reason code
+        # draws from the same bounded budget). Scenarios 4 and 5 legitimately
+        # drive several `policy.name_unresolved_block`/`enforce.blocked`
+        # records of their own (each `wait_until` poll against a still-denied
+        # destination is itself a `mode: block` deny with no domain and an
+        # active name-allow pattern) before this scenario ever runs, which
+        # can leave the shared bucket needing a real refill interval before
+        # THIS scenario's own `dns.untrusted_answer` record can be admitted
+        # -- an orthogonal, pre-existing throttle-budget characteristic of
+        # running many DNS-active scenarios in one session, not a
+        # correlation bug, and not something build chunk #14 is trying to
+        # fix. The retry budget below (up to ~75s total) comfortably spans
+        # two refill intervals so this scenario's PASS/FAIL reflects whether
+        # the answer was ever correctly attributed and reported at all, not
+        # an accident of exactly which token-bucket instant it landed on.
         events: list = []
         sec = None
         last_resolved = None
-        for attempt in range(5):
+        max_attempts = 25
+        for attempt in range(max_attempts):
             last_resolved = docker_exec(target, "nslookup", domain + ".", timeout=8)
             # Not gating on returncode: busybox nslookup queries A then AAAA
             # by default and exits nonzero if EITHER lookup fails; dnsmasq's
@@ -404,11 +410,11 @@ def scenario_6_untrusted_resolver() -> ScenarioResult:
             # a complete, successful A resolution. The forbidden IP actually
             # appearing in the output is what matters here.
             assert forbidden_ip in last_resolved.stdout, f"the rogue resolver should answer with the forbidden IP: {last_resolved.stdout} {last_resolved.stderr}"
-            sec = daemon.wait_for(lambda m: m.get("kind") == "security" and m.get("attributes", {}).get("reason") == "dns.untrusted_answer" and m.get("attributes", {}).get("container.id") == cid, timeout=4, drain_into=events)
+            sec = daemon.wait_for(lambda m: m.get("kind") == "security" and m.get("attributes", {}).get("reason") == "dns.untrusted_answer" and m.get("attributes", {}).get("container.id") == cid, timeout=3, drain_into=events)
             if sec is not None:
                 break
-            log(f"attempt {attempt + 1}/5: client resolved fine but bathyscaphe's own dns_snoop capture missed this answer (a documented best-effort characteristic); retrying the query")
-        assert sec is not None, f"expected a dns.untrusted_answer security record for this container after 5 attempts; drained: {events}"
+            log(f"attempt {attempt + 1}/{max_attempts}: client resolved fine but bathyscaphe's own dns_snoop capture missed this answer, or the shared R1 throttle hasn't refilled yet; retrying the query")
+        assert sec is not None, f"expected a dns.untrusted_answer security record for this container after {max_attempts} attempts; drained: {events}"
 
         # No amount of waiting should ever seed it.
         time.sleep(3)
@@ -416,17 +422,67 @@ def scenario_6_untrusted_resolver() -> ScenarioResult:
         assert not still_denied.ok, "an untrusted-sourced answer must never seed the allow-map, even though the name pattern matched"
 
         details = f"security record reason={sec['attributes']['reason']!r} resolver.addr={sec['attributes'].get('resolver.addr')!r} domain={sec['attributes'].get('domain')!r}; forbidden IP denied before={not baseline_denied.ok} and after 3s settle={not still_denied.ok}"
-        return ScenarioResult("6_untrusted_resolver", "PROVEN", details)
+        return ScenarioResult(scenario_name, "PROVEN", details)
+    finally:
+        if cid:
+            daemon.release(cid)
+        docker_rm(rogue)
+        docker_rm(target)
+        network_rm(net)
+
+
+def scenario_6_untrusted_resolver() -> ScenarioResult:
+    # This scenario runs against its OWN dedicated daemon/bpffs root
+    # (UNTRUSTED_ROOT), NOT the shared MAIN daemon scenarios 1/2/4/5 use --
+    # kept that way for isolation (a fresh process starts with an empty
+    # correlation table, so this scenario proves its own claim with no
+    # dependency on run order at all). Build chunk #13 found (and build
+    # chunk #14 FIXED, see `docs/TESTING.md`'s "Build chunk #14" section)
+    # a real cross-container DNS correlation bug that made running THIS
+    # scenario's logic sharing a daemon session with scenarios 4/5
+    # unreliable; `scenario_8_untrusted_resolver_shared_daemon` below is
+    # the scenario that specifically re-runs this exact logic against the
+    # SHARED main daemon, right after 4 and 5, to prove that bug is now
+    # fixed -- this scenario stays isolated as the original, dependency-free
+    # proof of the untrusted-resolver behavior itself.
+    root = UNTRUSTED_ROOT
+    subprocess.run(["rm", "-rf", root])
+    daemon = None
+    try:
+        daemon = Daemon(root, stats_interval_s=1)
+        daemon.handshake()
+        return _untrusted_resolver_flow(daemon, "6_untrusted_resolver", "")
     finally:
         if daemon is not None:
             daemon.shutdown()
             daemon.wait_exit(timeout=10)
             if daemon.proc.poll() is None:
                 daemon.kill()
-        docker_rm(rogue)
-        docker_rm(target)
-        network_rm(net)
         subprocess.run(["rm", "-rf", root])
+
+
+def scenario_8_untrusted_resolver_shared_daemon(daemon: Daemon) -> ScenarioResult:
+    """Build chunk #14's regression proof for the chunk #13 finding: runs
+    the IDENTICAL untrusted-resolver logic as scenario 6, but against the
+    SHARED `daemon` (the same MAIN daemon session scenarios 1/2/4/5 already
+    ran against) -- this is the exact live repro chunk #13 documented
+    (`docs/TESTING.md`, "Build chunk #13", bug #1): scenarios 4 and 5 each
+    do several real DNS round trips and `release()` their containers, which
+    used to leave STALE `PendingQueryTable` entries behind that a later,
+    unrelated container's query could collide with. Build chunk #14 fixed
+    this two ways that both apply here: (a) `apply_release` now purges a
+    released container's pending entries (`crate::dns::pending`'s "Cleanup
+    on release"), so scenarios 4/5's own entries are gone by the time this
+    scenario's query fires; (b) even if a collision still happened, the
+    correlation table now detects the ambiguity and refuses to guess rather
+    than silently preferring a stale, wrong cgroup id. Depends on the
+    DEFAULT run order (`run_integration.py`'s `SCENARIOS` dict runs
+    scenarios in ascending number order, so 4 and 5 have already executed
+    against this same `daemon` by the time this one starts) -- run in
+    isolation (e.g. `run_integration.py 8`) this scenario still passes, it
+    just no longer specifically exercises the "after 4/5" ordering that
+    used to matter."""
+    return _untrusted_resolver_flow(daemon, "8_untrusted_resolver_shared_daemon", "-shared")
 
 
 def scenario_7_reconciliation() -> ScenarioResult:
@@ -478,4 +534,148 @@ def scenario_7_reconciliation() -> ScenarioResult:
         if daemon2 is not None and daemon2.proc.poll() is None:
             daemon2.kill()
         docker_rm(name)
+        subprocess.run(["rm", "-rf", root])
+
+
+def scenario_9_cross_container_isolation() -> ScenarioResult:
+    """Build chunk #14's direct security proof: two DIFFERENT containers,
+    each with its OWN active name-allow pattern for BOTH backends, are made
+    to send a DNS query with the EXACT SAME transaction id and source port
+    to Docker's embedded resolver at (as close to) the same instant --
+    deterministically forcing the exact `(txid, port)` collision
+    `docs/TESTING.md`'s chunk #13 finding showed is practically reachable,
+    rather than hoping real ephemeral-port/txid randomness produces one.
+    Each container only ever queries its OWN backend's name -- so the ONLY
+    way either container's `POLICY` map could ever gain a route to the
+    OTHER backend's resolved address is a cross-container misattribution of
+    the other container's answer. Asserts that never happens, in either
+    direction, and that the fix's fail-safe (refuse to guess, in EITHER
+    direction, rather than pick one) doesn't silently break normal,
+    non-colliding DNS resolution afterward."""
+    root = XCORR_ROOT
+    net = "bathyscaphe-itest-xcorr-net"
+    backend_a = "bathyscaphe-itest-xcorr-backend-a"
+    backend_b = "bathyscaphe-itest-xcorr-backend-b"
+    target_a = "bathyscaphe-itest-xcorr-a"
+    target_b = "bathyscaphe-itest-xcorr-b"
+    subprocess.run(["rm", "-rf", root])
+    network_rm(net)
+    for name in (backend_a, backend_b, target_a, target_b):
+        docker_rm(name)
+    network_create(net)
+    docker_run(backend_a, network=net, cmd=["nc", "-lk", "-p", "8080"])
+    docker_run(backend_b, network=net, cmd=["nc", "-lk", "-p", "8080"])
+    docker_run(target_a, network=net)
+    docker_run(target_b, network=net)
+    cid_a = None
+    cid_b = None
+    daemon = None
+    try:
+        backend_a_ip = docker_ip(backend_a, net)
+        backend_b_ip = docker_ip(backend_b, net)
+
+        daemon = Daemon(root, stats_interval_s=1)
+        daemon.handshake()
+
+        cid_a = docker_id(target_a)
+        cid_b = docker_id(target_b)
+
+        # BOTH containers register allow patterns for BOTH backend names --
+        # deliberately, so that a route to the OTHER backend can ONLY ever
+        # appear via cross-attribution of the other container's own answer,
+        # never via this container's own genuine traffic (each only ever
+        # queries its own name below).
+        rules = [
+            name_rule("r-allow-a", "allow", backend_a, 8080, "tcp"),
+            name_rule("r-allow-b", "allow", backend_b, 8080, "tcp"),
+            cidr_rule("r-allow-dns", "allow", "127.0.0.11/32", 53, "udp"),
+        ]
+        ack_a = daemon.push_policy(cid_a, mode="block", default="deny", rules=rules)
+        assert ack_a["status"] == "applied", ack_a
+        ack_b = daemon.push_policy(cid_b, mode="block", default="deny", rules=rules)
+        assert ack_b["status"] == "applied", ack_b
+
+        baseline_a_to_b = tcp_probe(target_a, backend_b_ip, 8080)
+        baseline_b_to_a = tcp_probe(target_b, backend_a_ip, 8080)
+        assert not baseline_a_to_b.ok and not baseline_b_to_a.ok, "sanity: neither cross-route exists before any DNS traffic happens at all"
+
+        # Force the collision: an IDENTICAL (txid, source port) DNS query,
+        # each container asking for its OWN backend's name, fired as close
+        # to simultaneously as this harness can manage.
+        forced_txid = 0x5A5A
+        forced_port = 44100
+        query_a = _build_dns_a_query(forced_txid, backend_a)
+        query_b = _build_dns_a_query(forced_txid, backend_b)
+
+        results: dict[str, subprocess.CompletedProcess] = {}
+
+        def fire(name: str, container: str, payload: bytes) -> None:
+            results[name] = docker_exec_stdin(container, ["nc", "-u", "-p", str(forced_port), "-w", "2", "127.0.0.11", "53"], payload, timeout=5)
+
+        t_a = threading.Thread(target=fire, args=("a", target_a, query_a))
+        t_b = threading.Thread(target=fire, args=("b", target_b, query_b))
+        t_a.start()
+        t_b.start()
+        t_a.join(timeout=6)
+        t_b.join(timeout=6)
+        assert results["a"].returncode == 0, f"container A's crafted query failed: {results['a']}"
+        assert results["b"].returncode == 0, f"container B's crafted query failed: {results['b']}"
+        assert len(results["a"].stdout) > 0, "container A's crafted query got no DNS response at all"
+        assert len(results["b"].stdout) > 0, "container B's crafted query got no DNS response at all"
+
+        # Give the (best-effort, ring-buffer-based) DNS capture pipeline a
+        # moment to actually process both responses.
+        time.sleep(2)
+
+        # The security property: NEITHER container ever gets a route to the
+        # OTHER's backend, in EITHER direction -- this is the direct proof
+        # that container A's answer never seeds container B's POLICY map
+        # (and vice versa).
+        cross_a_to_b = tcp_probe(target_a, backend_b_ip, 8080)
+        cross_b_to_a = tcp_probe(target_b, backend_a_ip, 8080)
+        assert not cross_a_to_b.ok, "container A must NEVER be seeded with a route to container B's backend via a forced correlation collision"
+        assert not cross_b_to_a.ok, "container B must NEVER be seeded with a route to container A's backend via a forced correlation collision"
+
+        # Recovery: a later, NON-colliding, ordinary DNS lookup (the OS
+        # picks a fresh ephemeral port, no forced collision) must still let
+        # each container reach its OWN backend -- the fix fails safe during
+        # a genuine ambiguity, it does not permanently wedge DNS-derived
+        # enforcement.
+        resolved_a = docker_exec(target_a, "nslookup", backend_a + ".", timeout=8)
+        assert resolved_a.returncode == 0 and backend_a_ip in resolved_a.stdout, f"container A's own (non-colliding) lookup should resolve fine: {resolved_a.stdout} {resolved_a.stderr}"
+        resolved_b = docker_exec(target_b, "nslookup", backend_b + ".", timeout=8)
+        assert resolved_b.returncode == 0 and backend_b_ip in resolved_b.stdout, f"container B's own (non-colliding) lookup should resolve fine: {resolved_b.stdout} {resolved_b.stderr}"
+
+        seeded_a = wait_until(lambda: tcp_probe(target_a, backend_a_ip, 8080).ok, timeout=10, interval=1)
+        seeded_b = wait_until(lambda: tcp_probe(target_b, backend_b_ip, 8080).ok, timeout=10, interval=1)
+        assert seeded_a, "container A must recover and reach its OWN backend once its DNS answer is unambiguous"
+        assert seeded_b, "container B must recover and reach its OWN backend once its DNS answer is unambiguous"
+
+        # The cross-routes must STILL never have appeared, even after the
+        # containers' own (correct) routes were seeded.
+        still_cross_a_to_b = tcp_probe(target_a, backend_b_ip, 8080)
+        still_cross_b_to_a = tcp_probe(target_b, backend_a_ip, 8080)
+        assert not still_cross_a_to_b.ok, "container A must still never reach container B's backend, even after its own backend was correctly seeded"
+        assert not still_cross_b_to_a.ok, "container B must still never reach container A's backend, even after its own backend was correctly seeded"
+
+        details = (
+            f"forced (txid=0x{forced_txid:04x}, port={forced_port}) collision fired for both containers; "
+            f"immediately after: A->B cross-route denied={not cross_a_to_b.ok}, B->A cross-route denied={not cross_b_to_a.ok}; "
+            f"after recovery: A->own backend allowed={seeded_a}, B->own backend allowed={seeded_b}, "
+            f"A->B still denied={not still_cross_a_to_b.ok}, B->A still denied={not still_cross_b_to_a.ok}"
+        )
+        return ScenarioResult("9_cross_container_isolation", "PROVEN", details)
+    finally:
+        if daemon is not None:
+            if cid_a:
+                daemon.release(cid_a)
+            if cid_b:
+                daemon.release(cid_b)
+            daemon.shutdown()
+            daemon.wait_exit(timeout=10)
+            if daemon.proc.poll() is None:
+                daemon.kill()
+        for name in (backend_a, backend_b, target_a, target_b):
+            docker_rm(name)
+        network_rm(net)
         subprocess.run(["rm", "-rf", root])
