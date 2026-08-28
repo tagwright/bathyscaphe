@@ -335,24 +335,66 @@ mod tests {
     fn make_before_break_diff_removes_stale_keys_not_in_the_new_snapshot() {
         let mut probe = MockProbe::new();
         let lookup = lookup_with_one_container(11);
+        // Build chunk #11 (Part C): this `seed_path` call was MISSING here
+        // originally. Without it, `apply_policy`'s first call attaches
+        // through `resolve_or_attach` (the path is unseeded, so
+        // `MockProbe::attach_container` invents its own cgroup id, say 1,
+        // rather than the 11 `lookup_with_one_container` claims), and the
+        // SECOND `apply_policy` call's `resolve_or_attach` sees `cgroup_id`
+        // 11 is still not in `attached` (only 1 is) and tries to attach
+        // AGAIN -- the same path now maps to the already-attached id 1,
+        // so `MockProbe::attach_container` returns `Err("already
+        // attached")`, `resolve_or_attach` propagates it, and the second
+        // `apply_policy` returns `PolicyAckStatus::Error` WITHOUT EVER
+        // CALLING `apply_make_before_break`. The stale first-generation
+        // entries (the /24 plus the baseline -- also 2 keys) are then
+        // still sitting in `policy_keys` untouched, so the old
+        // `final_keys.len() == 2` assertion below passed by COINCIDENCE
+        // (2 stale keys, not 2 correctly-diffed ones), and the ordering
+        // assertion passed because `first_remove` was `None` (no
+        // `RemovePolicyKey` call ever happened) -- neither assertion
+        // exercised the actual make-before-break diff this test claims to
+        // prove. Seeding the path here makes both `apply_policy` calls
+        // attach cleanly under the SAME cgroup id, so the second call
+        // actually reaches `apply_make_before_break`.
+        probe.seed_path(&lookup.cgroup_path_for_container(&container_id()).unwrap(), 11);
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
 
         let first = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("10.0.0.0/24", WireAction::Allow)] };
-        apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &first);
+        let first_ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &first);
+        assert_eq!(first_ack.status, PolicyAckStatus::Applied, "sanity: the first push must actually apply");
         let keys_after_first = probe.tracked_policy_keys(11).len();
         assert_eq!(keys_after_first, 2, "the /24 rule plus the synthesized baseline");
 
         let second = Policy { container_id: container_id(), generation: 2, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("192.168.0.0/16", WireAction::Allow)] };
-        apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &second);
+        let second_ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &second);
+        assert_eq!(second_ack.status, PolicyAckStatus::Applied, "sanity: the second push must actually apply (a regression here would silently leave the diff below unexercised, exactly the original bug)");
 
         let final_keys = probe.tracked_policy_keys(11);
         assert_eq!(final_keys.len(), 2, "the old /24 entry must be gone, replaced by the new /16 plus baseline");
-        // Make happened before break: the mock recorded a SetPolicy call
-        // for the new snapshot before any RemovePolicyKey for the old one.
+        // Unlike the length check alone (which a stale no-op state could
+        // also satisfy), name the SPECIFIC keys: the /24 from the first
+        // generation must be gone, and the /16 from the second must be
+        // present.
+        let old_addr_bytes = crate::probe::policy::addr_to_rfc4291("10.0.0.0".parse().unwrap());
+        let new_addr_bytes = crate::probe::policy::addr_to_rfc4291("192.168.0.0".parse().unwrap());
+        assert!(!final_keys.contains(&(PolicyKeyData::MIN_PREFIX_LEN + 96 + 24, old_addr_bytes)), "the stale first-generation /24 entry must actually be removed, not merely absent by coincidence");
+        assert!(final_keys.contains(&(PolicyKeyData::MIN_PREFIX_LEN + 96 + 16, new_addr_bytes)), "the new second-generation /16 entry must actually be present");
+        // Make happened before break: every SetPolicy call for the new
+        // snapshot must precede the RemovePolicyKey call for the old one --
+        // i.e. the LAST insert's index must be LESS than the removal's.
+        // (The pre-chunk-#11 version of this assertion had the comparison
+        // BACKWARDS -- `last_set > first_remove` -- and only ever "passed"
+        // because `first_remove` was `None` on the unseeded path, short-
+        // circuiting the `|| first_remove.is_none()` clause; it never
+        // actually checked ordering. Fixed here alongside the seed_path
+        // fix, since a correct diff makes this comparison meaningful for
+        // the first time.)
         let first_remove = probe.calls.iter().position(|c| matches!(c, MockCall::RemovePolicyKey(_)));
+        assert!(first_remove.is_some(), "this diff must actually remove a stale key -- a None here would mean the diff never ran at all, the original bug's exact failure mode");
         let last_set_for_second_gen = probe.calls.iter().rposition(|c| matches!(c, MockCall::SetPolicy(_)));
-        assert!(last_set_for_second_gen.unwrap() > first_remove.unwrap_or(0) || first_remove.is_none(), "inserts for the new snapshot must happen before removals of the old one");
+        assert!(last_set_for_second_gen.unwrap() < first_remove.unwrap(), "inserts for the new snapshot must happen before removals of the old one");
     }
 
     #[test]

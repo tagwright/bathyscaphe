@@ -138,6 +138,20 @@ impl NamePatternStore {
         self.by_cgroup.get(&cgroup_id)?.iter().find(|p| p.action == RuleAction::Allow && pattern_matches(&p.pattern, name))
     }
 
+    /// The first registered `Deny` pattern for `cgroup_id` matching `name`
+    /// (already normalized), if any -- build chunk #11's name-based deny
+    /// enforcement (`daemon::fqdn::on_dns_answer`). Same "first match wins,
+    /// no cross-pattern merging" simplification as
+    /// [`Self::first_matching_allow`], and the same independent lookup: a
+    /// name can match a `Deny` pattern here AND an `Allow` pattern via
+    /// [`Self::first_matching_allow`] at once (a container can legitimately
+    /// register both), with `daemon::fqdn::on_dns_answer` deciding which
+    /// wins (deny always does, per `bathy_build_spec.md`'s wire-level
+    /// "deny wins at equal specificity" rule).
+    pub fn first_matching_deny(&self, cgroup_id: u64, name: &str) -> Option<&NamePattern> {
+        self.by_cgroup.get(&cgroup_id)?.iter().find(|p| p.action == RuleAction::Deny && pattern_matches(&p.pattern, name))
+    }
+
     /// Whether `cgroup_id` has at least one registered `Allow` name
     /// pattern at all (regardless of whether any particular name matches
     /// it). Used by `daemon::fqdn::NameUnresolvedBlockWatcher` to decide
@@ -254,5 +268,39 @@ mod tests {
         store.set_patterns(1, vec![allow_pattern("r1", "github.com")]);
         store.remove_container(1);
         assert!(!store.has_active_allow_pattern(1));
+    }
+
+    fn deny_pattern(rule_id: &str, pattern: &str) -> NamePattern {
+        NamePattern { rule_id: rule_id.to_string(), pattern: pattern.to_string(), action: RuleAction::Deny, port: None, proto: None }
+    }
+
+    #[test]
+    fn first_matching_deny_finds_a_registered_deny_pattern() {
+        let mut store = NamePatternStore::new();
+        store.set_patterns(1, vec![deny_pattern("r1", "evil.example.com")]);
+        let hit = store.first_matching_deny(1, "evil.example.com").expect("should match");
+        assert_eq!(hit.rule_id, "r1");
+    }
+
+    #[test]
+    fn first_matching_deny_ignores_an_allow_pattern() {
+        let mut store = NamePatternStore::new();
+        store.set_patterns(1, vec![allow_pattern("r1", "github.com")]);
+        assert!(store.first_matching_deny(1, "github.com").is_none());
+    }
+
+    #[test]
+    fn first_matching_deny_returns_none_on_a_non_match() {
+        let mut store = NamePatternStore::new();
+        store.set_patterns(1, vec![deny_pattern("r1", "evil.example.com")]);
+        assert!(store.first_matching_deny(1, "example.com").is_none());
+    }
+
+    #[test]
+    fn a_name_can_match_both_an_allow_and_a_deny_pattern_independently() {
+        let mut store = NamePatternStore::new();
+        store.set_patterns(1, vec![allow_pattern("r-allow", "*.example.com"), deny_pattern("r-deny", "evil.example.com")]);
+        assert!(store.first_matching_allow(1, "evil.example.com").is_some(), "the wildcard allow also matches this name");
+        assert!(store.first_matching_deny(1, "evil.example.com").is_some(), "the exact deny matches too -- daemon::fqdn::on_dns_answer decides deny wins");
     }
 }

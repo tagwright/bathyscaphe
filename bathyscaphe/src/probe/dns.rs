@@ -332,7 +332,7 @@ mod live_smoke {
                     }
                     let Some(parsed) = parse_dns_response(capture.captured()) else { continue };
                     for (addr, ttl) in &parsed.answers {
-                        cache.record(cgroup_id, parsed.name.clone(), *addr, *ttl, capture.ktime_ns);
+                        cache.record(cgroup_id, parsed.name.clone(), *addr, *ttl, capture.ktime_ns, true);
                     }
                     if !parsed.answers.is_empty() {
                         exact_match = Some((parsed.name.clone(), parsed.answers[0].0, capture.ktime_ns));
@@ -380,6 +380,158 @@ mod live_smoke {
     enum DnsSmokeOutcome {
         ExactMatch { name: String, addr: std::net::IpAddr },
         CapturedButUnmatched { seen_cgroup_id: u64, wanted_cgroup_id: u64, bytes: Vec<u8> },
+    }
+
+    /// Build chunk #11's own privileged proof point: does `dns_snoop`'s NEW
+    /// source-address reads (`ctx.load(12)` for IPv4, `ctx.load(8)` for
+    /// IPv6, added alongside this chunk) actually pass the verifier and
+    /// capture the REAL responding resolver's address on a live kernel --
+    /// as opposed to chunk #9/#10's cgroup-attribution question, which this
+    /// test does not re-litigate (see the sibling test above and
+    /// `docs/TESTING.md` for that separate, already-settled confound).
+    /// `bathyscaphe_common::DnsCapture::src_addr` is a NEW field this
+    /// chunk added; nothing about it was exercisable before a live kernel
+    /// actually ran the modified eBPF program.
+    ///
+    /// This test's own success criterion is intentionally narrow and
+    /// downgrades gracefully, matching the sibling test's "do not
+    /// rabbit-hole" posture: it hard-fails only if the verifier rejects
+    /// the modified program, if attach fails, or if `dns_snoop` captures
+    /// NOTHING at all (any of which would mean the new src_addr reads
+    /// broke something). If it captures a real DNS response but the
+    /// response's own source happens not to be `127.0.0.11` on this
+    /// specific host (a host whose Docker daemon's embedded resolver is
+    /// reached some other way, or a host where a DNS-intercepting
+    /// component answers instead -- both already documented, unrelated
+    /// confounds), it reports that fact without failing rather than
+    /// asserting a specific address this test cannot control. What it
+    /// insists on unconditionally: whatever address WAS captured actually
+    /// round-trips through `Ipv6Addr::to_ipv4_mapped` back to a real,
+    /// non-zero IPv4 address -- proof the kernel wrote real packet bytes,
+    /// not the field's zero-initialized default.
+    #[test]
+    #[ignore = "requires root, --privileged, a real cgroup2 host, a writable bpffs, and a reachable Docker socket -- see docs/TESTING.md"]
+    fn dns_snoop_captures_the_responses_own_source_address() {
+        use crate::dns::TrustedResolvers;
+        use crate::dns::trust::DOCKER_EMBEDDED_DNS;
+        use std::net::Ipv6Addr;
+
+        if !running_as_root() {
+            eprintln!("dns live_smoke (src_addr): skipping, not running as root");
+            return;
+        }
+        if !docker_socket_reachable() {
+            eprintln!("dns live_smoke (src_addr): skipping, {DOCKER_SOCKET} is not reachable in this environment");
+            return;
+        }
+
+        const BPFFS_ROOT_SRC_ADDR: &str = "/sys/fs/bpf/bathyscaphe-dns-src-addr-smoke-test";
+        const TEST_CONTAINER_NAME_SRC_ADDR: &str = "bathyscaphe-itest-dns-src-addr-smoke";
+
+        remove_test_container(TEST_CONTAINER_NAME_SRC_ADDR);
+        if let Err(error) = ensure_test_network() {
+            panic!("failed to ensure the throwaway test network exists: {error}");
+        }
+        let bpffs_root = PathBuf::from(BPFFS_ROOT_SRC_ADDR);
+        let _ = Probe::unpin_all_at(&bpffs_root);
+
+        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone()).expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection of dns_snoop's new source-address reads would surface here");
+
+        // Unlike the sibling test above (a single `nslookup`, 1s in), this
+        // repeats the lookup every second for 10s: attaching a fresh probe
+        // to a freshly-created network/cgroup can itself take a variable
+        // amount of wall-clock time (finding the cgroup directory alone
+        // loops up to 10s below), so a single early query risks a race
+        // where `attach_container` hasn't run yet by the time it fires --
+        // repeating gives the attach step a comfortable window to land
+        // before at least one of several identical queries.
+        let create_body = format!(r#"{{"Image":"alpine:latest","Cmd":["sh","-c","for i in 1 2 3 4 5 6 7 8 9 10; do nslookup example.com; sleep 1; done"],"Tty":false,"HostConfig":{{"NetworkMode":"{TEST_NETWORK_NAME}"}}}}"#);
+        let container_id: Result<String, String> = (|| {
+            let (status, body) = docker_api("POST", &format!("/{API_VERSION}/containers/create?name={TEST_CONTAINER_NAME_SRC_ADDR}"), &create_body).map_err(|e| e.to_string())?;
+            if status != 201 {
+                return Err(format!("container create failed: HTTP {status}: {body}"));
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("create response was not JSON ({e}): {body}"))?;
+            let container_id = parsed.get("Id").and_then(|v| v.as_str()).ok_or_else(|| format!("create response had no Id: {body}"))?.to_string();
+            let (status, body) = docker_api("POST", &format!("/{API_VERSION}/containers/{container_id}/start"), "").map_err(|e| e.to_string())?;
+            if status != 204 {
+                return Err(format!("container start failed: HTTP {status}: {body}"));
+            }
+            Ok(container_id)
+        })();
+        let container_id = match container_id {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = probe.unpin_all();
+                remove_test_network();
+                panic!("failed to create the throwaway test container: {error}");
+            }
+        };
+
+        let outcome: Result<[u8; 16], String> = (|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let cgroup_path = loop {
+                if let Some(path) = find_cgroup_path_for(Path::new(DEFAULT_CGROUP_ROOT), &container_id) {
+                    break path;
+                }
+                if Instant::now() > deadline {
+                    return Err("timed out waiting for the container's cgroup directory to appear".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+
+            probe.attach_container(&cgroup_path).map_err(|e| format!("attach_container failed (this is where a verifier rejection of the new source-address reads would surface): {e:#}"))?;
+
+            let mut ring = probe.take_dns_events().ok_or("DNS ring buffer already taken")?;
+            let deadline = Instant::now() + Duration::from_secs(12);
+            // Deliberately does NOT require `parse_dns_response` to
+            // succeed: `dns_snoop` sets `src_addr` unconditionally on
+            // every UDP:53-sourced capture, whether or not the payload
+            // later parses as a complete DNS message (chunk #9's tiered,
+            // coarse-granularity capture -- see `bathyscaphe-ebpf::dns`'s
+            // own doc -- can genuinely truncate a real, well-formed
+            // multi-record response whose true size falls between two
+            // tiers, which this specific test environment's responses
+            // happened to on repeated runs; that is an orthogonal, already
+            // documented v1 characteristic of the PAYLOAD capture, not of
+            // the source-address capture this test exists to prove). The
+            // only thing this test needs is ONE real captured item with a
+            // nonzero length, from which `src_addr` is read.
+            while Instant::now() < deadline {
+                while let Some(item) = ring.next() {
+                    if item.len() != DnsCapture::WIRE_SIZE {
+                        continue;
+                    }
+                    // SAFETY: length just checked; matches
+                    // `probe::dns::decode_capture`'s own reasoning.
+                    let capture = unsafe { std::ptr::read_unaligned(item.as_ptr().cast::<DnsCapture>()) };
+                    if capture.len > 0 {
+                        return Ok(capture.src_addr);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err("dns_snoop captured no DNS response at all within the deadline -- this DOES indicate a capture-logic problem with the new source-address reads, not just a resolver-delivery nuance".to_string())
+        })();
+
+        remove_test_container(&container_id);
+        remove_test_network();
+        let _ = probe.unpin_all();
+
+        let src_addr_bytes = outcome.expect("attach_container must succeed (verifier acceptance of the new source-address reads) and dns_snoop must capture a real, parseable DNS response");
+        let v6 = Ipv6Addr::from(src_addr_bytes);
+        let captured_addr = v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6));
+        assert!(!captured_addr.is_unspecified(), "src_addr must be a real captured address, not the field's zero-initialized default -- a zero here would mean the new ctx.load(12)/ctx.load(8) reads never actually ran");
+
+        let docker_default_only = TrustedResolvers::default_set_from("");
+        if captured_addr == DOCKER_EMBEDDED_DNS {
+            assert!(docker_default_only.is_trusted(captured_addr), "127.0.0.11 must always be in the default trusted set");
+            eprintln!("dns live_smoke (src_addr): full proof -- captured src_addr {captured_addr} is Docker's embedded resolver, and the default trusted-resolver set trusts it, exactly as docs/DNS.md describes");
+        } else {
+            eprintln!(
+                "dns live_smoke (src_addr): PARTIAL proof -- verifier accepted the new source-address reads and dns_snoop captured a real DNS response's src_addr ({captured_addr}), proving the kernel-side capture itself works; on THIS host the responding resolver's address differs from the expected 127.0.0.11 (matching the sibling test's own documented resolver-delivery nuance for this host), so the default-trusts-it assertion is reported rather than enforced here -- would need a --trusted-resolver flag naming this host's actual resolver to see it seed enforcement, exactly as docs/DNS.md's fail-closed section describes."
+            );
+        }
     }
 }
 

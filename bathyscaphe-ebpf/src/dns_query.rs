@@ -57,7 +57,7 @@
 //!
 //! [`DnsQueryCapture`] is 24 bytes, far under the eBPF program stack's
 //! 512-byte limit even alongside this function's other locals, so unlike
-//! `dns_snoop`'s [`bathyscaphe_common::DnsCapture`] (536 bytes), it is
+//! `dns_snoop`'s [`bathyscaphe_common::DnsCapture`] (552 bytes), it is
 //! built by value on the stack and written into the reserved `RingBuf`
 //! slot with a plain `entry.write(...)` -- the same shape
 //! `bathyscaphe-ebpf::decide::emit_event` already uses for the similarly

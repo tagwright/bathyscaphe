@@ -73,6 +73,17 @@ pub mod reason {
     /// as the honest "name-allowed destination reached without a visible
     /// DNS answer" signal rather than an opaque, unexplained deny.
     pub const POLICY_NAME_UNRESOLVED_BLOCK: &str = "policy.name_unresolved_block";
+    /// Build chunk #11: a DNS answer arrived from a source NOT in the
+    /// operator-configured trusted-resolver set (`bathyscaphe::dns::trust`)
+    /// and nonetheless matched one of its container's own active `Allow`
+    /// name patterns. Nothing was inserted into `POLICY` because of it --
+    /// enforcement is gated on trust, never seeded from an untrusted
+    /// source -- this is purely the loud, potential-spoofing signal: a
+    /// container's own resolver (or something injecting traffic into its
+    /// netns) answered an allow-listed hostname with an untrusted-sourced
+    /// reply, exactly the scenario a trusted-resolver allowlist exists to
+    /// defeat.
+    pub const DNS_UNTRUSTED_ANSWER: &str = "dns.untrusted_answer";
 }
 
 /// OTel severity number scale, restricted to the three levels beacon

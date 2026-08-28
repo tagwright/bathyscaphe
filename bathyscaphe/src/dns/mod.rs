@@ -18,13 +18,17 @@
 //!   full attribution-fix design.
 //! - [`patterns`]: [`patterns::NamePatternStore`], build chunk #10's
 //!   per-container FQDN name-rule pattern registry and wildcard matching.
+//! - [`trust`]: [`trust::TrustedResolvers`], build chunk #11's
+//!   operator-configured trusted-resolver allowlist -- see that module's
+//!   doc for the spoofing gap it closes and the default set it builds.
 
 pub mod cache;
 pub mod parse;
 pub mod patterns;
 pub mod pending;
+pub mod trust;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 
 use bathyscaphe_common::{DnsCapture, DnsQueryCapture};
@@ -33,6 +37,20 @@ pub use cache::{DomainCache, DomainHit, STALE_GRACE_NS};
 pub use parse::{ParsedDnsResponse, parse_dns_response};
 pub use patterns::{NamePattern, NamePatternStore};
 pub use pending::PendingQueryTable;
+pub use trust::{TrustedResolvers, parse_resolv_conf_nameservers};
+
+/// Unmaps a captured RFC 4291 address back to an [`IpAddr`]: an
+/// IPv4-mapped-into-IPv6 address recovers its original [`IpAddr::V4`]
+/// form, anything else stays [`IpAddr::V6`]. Duplicated (rather than
+/// depended on) from `probe::policy`'s equivalent -- this module
+/// deliberately carries no dependency on `probe`, the same boundary
+/// `daemon::compile`'s own private `unmap_addr` keeps for the same reason
+/// (its own doc comment explains: kernel-touching-adjacent code stays out
+/// of a module meant to stay kernel-free and independently testable).
+fn unmap_addr(bytes: [u8; 16]) -> IpAddr {
+    let v6 = Ipv6Addr::from(bytes);
+    v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6))
+}
 
 /// One correctly-attributed (or, on `correlated: false`, best-effort)
 /// resolved DNS answer, handed from [`capture_callback`]'s cache-recording
@@ -64,6 +82,21 @@ pub struct AttributedAnswer {
     /// differ -- the whole cache/enforcement pipeline still functions --
     /// but a caller wanting to log/report confidence has the signal here).
     pub correlated: bool,
+    /// Build chunk #11: the response's own captured SOURCE address
+    /// (`bathyscaphe_common::DnsCapture::src_addr`, unmapped back to an
+    /// [`IpAddr`]). Unlike [`Self::correlated`], this is never wrong for
+    /// an injected/synthesized reply -- see that field's doc on
+    /// `DnsCapture`.
+    pub src_addr: IpAddr,
+    /// Build chunk #11: whether [`Self::src_addr`] is in the
+    /// operator-configured [`trust::TrustedResolvers`] set passed to
+    /// [`capture_callback`]. `daemon::fqdn::on_dns_answer` (Part A's
+    /// enforcement gate) only seeds `POLICY` from an answer where this is
+    /// `true` -- see `trust`'s module doc for the full trust model and
+    /// `docs/DNS.md` for how enrichment (`DomainCache`) is allowed to
+    /// treat an untrusted answer differently (recorded, but never as
+    /// `Asserted` confidence).
+    pub trusted: bool,
 }
 
 /// Extracts a DNS message's transaction id: the first two bytes, per RFC
@@ -91,7 +124,21 @@ fn extract_txid(bytes: &[u8]) -> Option<u16> {
 /// Returns the exact `Box<dyn FnMut(DnsCapture) + Send + 'static>` shape
 /// `probe::dns::DnsCaptureConsumer::spawn` (aliased there as
 /// `probe::DnsCallback`) expects.
-pub fn capture_callback(cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<PendingQueryTable>>, mut on_answer: impl FnMut(AttributedAnswer) + Send + 'static) -> Box<dyn FnMut(DnsCapture) + Send + 'static> {
+///
+/// `trusted_resolvers` (build chunk #11) gates nothing in THIS function --
+/// every parsed answer is still recorded into `cache` (enrichment) and
+/// still forwarded to `on_answer` (enforcement) regardless of trust. What
+/// changes is the `trusted` bit each of those two paths receives:
+/// [`cache::DomainCache::record`] uses it to floor a matching answer's
+/// confidence at [`bathyscaphe_proto::DomainConfidence::Inferred`]
+/// (`docs/DNS.md`'s enrichment-vs-enforcement trust section), and
+/// [`AttributedAnswer::trusted`] is what `daemon::fqdn::on_dns_answer`
+/// (Part A's actual enforcement gate) checks before ever calling
+/// `ProbeApi::set_policy`. Keeping the gate itself out of this function
+/// means every consumer sees the SAME trust signal and decides for itself
+/// how much to weight it, rather than this shared plumbing baking in one
+/// consumer's policy.
+pub fn capture_callback(cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<PendingQueryTable>>, trusted_resolvers: Arc<TrustedResolvers>, mut on_answer: impl FnMut(AttributedAnswer) + Send + 'static) -> Box<dyn FnMut(DnsCapture) + Send + 'static> {
     Box::new(move |capture: DnsCapture| {
         let Some(parsed) = parse::parse_dns_response(capture.captured()) else {
             return;
@@ -108,15 +155,18 @@ pub fn capture_callback(cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<Pendi
             None => (capture.cgroup_id, false),
         };
 
+        let src_addr = unmap_addr(capture.src_addr);
+        let trusted = trusted_resolvers.is_trusted(src_addr);
+
         {
             let mut cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
             for (addr, ttl_secs) in &parsed.answers {
-                cache.record(cgroup_id, parsed.name.clone(), *addr, *ttl_secs, capture.ktime_ns);
+                cache.record(cgroup_id, parsed.name.clone(), *addr, *ttl_secs, capture.ktime_ns, trusted);
             }
         }
 
         for (addr, ttl_secs) in parsed.answers {
-            on_answer(AttributedAnswer { cgroup_id, name: parsed.name.clone(), addr, ttl_secs, ktime_ns: capture.ktime_ns, correlated });
+            on_answer(AttributedAnswer { cgroup_id, name: parsed.name.clone(), addr, ttl_secs, ktime_ns: capture.ktime_ns, correlated, src_addr, trusted });
         }
     })
 }
@@ -149,6 +199,27 @@ mod tests {
         assert_eq!(extract_txid(&[]), None);
     }
 
+    /// Embeds an [`IpAddr`] into the RFC 4291 form `DnsCapture::src_addr`
+    /// expects. Test-only counterpart to production's `unmap_addr` --
+    /// duplicated rather than shared for the same "no probe dependency"
+    /// boundary reason `unmap_addr`'s own doc gives.
+    fn embed_addr(addr: IpAddr) -> [u8; 16] {
+        match addr {
+            IpAddr::V4(v4) => {
+                let mut bytes = [0u8; 16];
+                bytes[10] = 0xff;
+                bytes[11] = 0xff;
+                bytes[12..16].copy_from_slice(&v4.octets());
+                bytes
+            }
+            IpAddr::V6(v6) => v6.octets(),
+        }
+    }
+
+    fn trusted_set(addr: IpAddr) -> Arc<TrustedResolvers> {
+        Arc::new(TrustedResolvers::new([addr]))
+    }
+
     #[test]
     fn capture_callback_uses_the_correlated_cgroup_id_over_the_captures_own() {
         let cache = Arc::new(Mutex::new(DomainCache::new()));
@@ -157,19 +228,21 @@ mod tests {
         // reality), recording the CORRECT cgroup id under (txid, src_port).
         pending.lock().unwrap().record_query(0xBEEF, 44321, /*correct*/ 100, 1_000_000_000);
 
+        let resolver_addr = IpAddr::from([127, 0, 0, 11]);
         let answers = Arc::new(Mutex::new(Vec::new()));
         let answers_clone = Arc::clone(&answers);
-        let mut callback = capture_callback(Arc::clone(&cache), Arc::clone(&pending), move |answer| {
+        let mut callback = capture_callback(Arc::clone(&cache), Arc::clone(&pending), trusted_set(resolver_addr), move |answer| {
             answers_clone.lock().unwrap().push(answer);
         });
 
         // Build a real DNS response payload (txid 0xBEEF) whose OWN
         // capture cgroup_id is deliberately the WRONG one (simulating
         // docker.service's), arriving on dst_port 44321 (the query's own
-        // src_port).
+        // src_port), from the trusted resolver address.
         let payload = build_a_response(0xBEEF, "example.com.", 300, [93, 184, 216, 34]);
         let mut capture = DnsCapture::zeroed_for(/*wrong*/ 999, 1_000_000_500);
         capture.dst_port = 44321;
+        capture.src_addr = embed_addr(resolver_addr);
         capture.payload[..payload.len()].copy_from_slice(&payload);
         capture.len = payload.len() as u16;
 
@@ -180,6 +253,8 @@ mod tests {
         assert_eq!(recorded[0].cgroup_id, 100, "the correlated (correct) cgroup id must win over the capture's own (wrong) one");
         assert!(recorded[0].correlated);
         assert_eq!(recorded[0].name, "example.com");
+        assert_eq!(recorded[0].src_addr, resolver_addr);
+        assert!(recorded[0].trusted, "the resolver address is in the trusted set");
 
         // The cache itself must also be keyed under the CORRECTED cgroup
         // id, not the response's own.
@@ -194,7 +269,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
         let answers = Arc::new(Mutex::new(Vec::new()));
         let answers_clone = Arc::clone(&answers);
-        let mut callback = capture_callback(cache, pending, move |answer| answers_clone.lock().unwrap().push(answer));
+        let mut callback = capture_callback(cache, pending, trusted_set(IpAddr::from([8, 8, 8, 8])), move |answer| answers_clone.lock().unwrap().push(answer));
 
         let payload = build_a_response(0x0001, "example.com.", 60, [1, 2, 3, 4]);
         let mut capture = DnsCapture::zeroed_for(777, 0);
@@ -208,6 +283,40 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].cgroup_id, 777, "an uncorrelatable response falls back to its own capture's cgroup_id");
         assert!(!recorded[0].correlated);
+    }
+
+    #[test]
+    fn capture_callback_marks_an_answer_from_an_untrusted_source_as_untrusted() {
+        let cache = Arc::new(Mutex::new(DomainCache::new()));
+        let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let answers_clone = Arc::clone(&answers);
+        // Trusted set contains a DIFFERENT address than the one the
+        // response will actually arrive from.
+        let mut callback = capture_callback(Arc::clone(&cache), pending, trusted_set(IpAddr::from([127, 0, 0, 11])), move |answer| answers_clone.lock().unwrap().push(answer));
+
+        let untrusted_source = IpAddr::from([203, 0, 113, 53]);
+        let payload = build_a_response(0x0002, "example.com.", 60, [1, 2, 3, 4]);
+        let mut capture = DnsCapture::zeroed_for(1, 0);
+        capture.dst_port = 22222;
+        capture.src_addr = embed_addr(untrusted_source);
+        capture.payload[..payload.len()].copy_from_slice(&payload);
+        capture.len = payload.len() as u16;
+
+        callback(capture);
+
+        let recorded = answers.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].src_addr, untrusted_source);
+        assert!(!recorded[0].trusted, "an answer from an address outside the trusted set must be marked untrusted");
+
+        // Enrichment still records it (per docs/DNS.md), but never as
+        // Asserted -- see cache.rs's own dedicated tests for the full
+        // confidence-flooring behavior; this just proves the bit reaches
+        // the cache call at all.
+        let cache = cache.lock().unwrap();
+        let hit = cache.lookup(1, IpAddr::from([1, 2, 3, 4]), 0).expect("untrusted answers are still recorded for enrichment");
+        assert_eq!(hit.confidence, bathyscaphe_proto::DomainConfidence::Inferred, "an untrusted answer is never Asserted, even when perfectly fresh");
     }
 
     #[test]

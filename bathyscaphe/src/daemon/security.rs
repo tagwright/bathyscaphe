@@ -101,6 +101,33 @@ pub fn name_unresolved_block_record(timestamp: String, container: SecurityContai
     record
 }
 
+/// Build chunk #11's loud potential-spoofing signal: a DNS answer for
+/// `domain` arrived from `src_addr`, which is NOT in the operator-configured
+/// trusted-resolver set, yet would have matched one of this container's own
+/// active `Allow` name patterns. `daemon::fqdn::on_dns_answer` never inserts
+/// anything into `POLICY` because of an untrusted-sourced answer -- this
+/// record exists purely to make the attempt visible: a container's own
+/// resolver (or something able to inject a reply into its network
+/// namespace) answering an allow-listed hostname from an untrusted source
+/// is exactly the spoofing scenario `bathyscaphe::dns::trust`'s
+/// trusted-resolver allowlist exists to defeat. Severity `Warning`, not
+/// `Error`: unlike `policy.name_unresolved_block`, nothing was actually
+/// enforced or denied as a direct result of this specific answer -- it is a
+/// signal worth an operator's attention, not an active block.
+pub fn dns_untrusted_answer_record(timestamp: String, container: SecurityContainer<'_>, src_addr: std::net::IpAddr, domain: &str) -> SecurityRecord {
+    let mut record = SecurityRecord::new(
+        timestamp,
+        Severity::Warning,
+        format!("a DNS answer for {domain:?} arrived from {src_addr}, which is not in the trusted-resolver set, and would have matched an active allow-listed name rule; the answer was NOT used to seed enforcement"),
+        reason::DNS_UNTRUSTED_ANSWER,
+        container,
+        None,
+        Some(domain),
+    );
+    record.attributes.insert("resolver.addr".to_string(), serde_json::Value::from(src_addr.to_string()));
+    record
+}
+
 /// A tamper/event-drops record: the per-container `TAMPER` counter moved
 /// since the last `stats` tick. `severity` is caller-supplied so R2's
 /// escalation path (`super::r2`) can hand this the same reason code at
@@ -150,6 +177,15 @@ mod tests {
         assert_eq!(record.attributes.get("dst.addr").unwrap(), "203.0.113.9");
         assert_eq!(record.attributes.get("dst.port").unwrap(), 443);
         assert!(record.attributes.get("domain").is_none(), "the whole point of this record is that no domain was ever observed");
+    }
+
+    #[test]
+    fn dns_untrusted_answer_record_is_warning_severity_and_carries_the_reason() {
+        let record = dns_untrusted_answer_record("2026-08-28T00:00:00Z".to_string(), container(), std::net::IpAddr::from([203, 0, 113, 53]), "github.com");
+        assert_eq!(record.severity_text, "WARN");
+        assert_eq!(record.attributes.get("reason").unwrap(), reason::DNS_UNTRUSTED_ANSWER);
+        assert_eq!(record.attributes.get("resolver.addr").unwrap(), "203.0.113.53");
+        assert_eq!(record.attributes.get("domain").unwrap(), "github.com");
     }
 
     #[test]

@@ -1,17 +1,17 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # DNS observation and FQDN enforcement
 
-Build chunks #9 (DNS observation) and #10 (query/response correlation +
-FQDN enforcement) of the sequence in `bathy_build_spec.md`. This document
-is the honest account of what bathyscaphe's DNS layer sees, what it
-structurally cannot see, and how the pieces fit together. IP/CIDR policy
-remains the ground truth throughout (`bathy_build_spec.md`'s BUILD-THROUGH
-STANCE); FQDN enforcement (chunk #10) is best-effort, layered on top of
-that same ground truth, never a replacement for it -- stated plainly, not
-just implied: a name rule can only ever ADD host routes to the allow-map
-that IP/CIDR policy already governs, and every gap documented below falls
-straight back to the container's ordinary IP/CIDR default, never to a
-silent allow.
+Build chunks #9 (DNS observation), #10 (query/response correlation + FQDN
+enforcement), and #11 (trusted-resolver enforcement + name-based deny) of
+the sequence in `bathy_build_spec.md`. This document is the honest account
+of what bathyscaphe's DNS layer sees, what it structurally cannot see, and
+how the pieces fit together. IP/CIDR policy remains the ground truth
+throughout (`bathy_build_spec.md`'s BUILD-THROUGH STANCE); FQDN enforcement
+(chunks #10-#11) is best-effort, layered on top of that same ground truth,
+never a replacement for it -- stated plainly, not just implied: a name
+rule can only ever ADD host routes to the allow-map that IP/CIDR policy
+already governs, and every gap documented below falls straight back to the
+container's ordinary IP/CIDR default, never to a silent allow.
 
 ## What is captured, and how
 
@@ -21,8 +21,16 @@ UDP datagram whose *source* port is 53 (a DNS response arriving at the
 container from its resolver, whether that resolver is an external server
 or Docker's embedded resolver at `127.0.0.11:53` reached over loopback)
 and copies up to `bathyscaphe_common::dns::DNS_CAPTURE_MAX` (512) bytes of
-its payload, plus the observing cgroup id and a kernel timestamp, into a
-dedicated `DNS_EVENTS` ring buffer. It never parses the DNS message itself
+its payload, plus the observing cgroup id, a kernel timestamp, and (as of
+build chunk #11) the packet's own IP-layer SOURCE address, into a
+dedicated `DNS_EVENTS` ring buffer. That source address
+(`bathyscaphe_common::dns::DnsCapture::src_addr`, IPv4-mapped-into-IPv6 per
+RFC 4291, the same embedding `Event::src_addr`/`PolicyKeyData::addr` use)
+is what chunk #11's trusted-resolver check (below) is built on -- unlike
+`cgroup_id`, which an injected/synthesized reply can misattribute (see
+"Chunk #10" below), a packet's own source address is set by whatever real
+host sent it and is not something a process sharing the container's
+network namespace can rewrite from the receiving side. It never parses the DNS message itself
 -- DNS's variable-length labels and compression pointers are a poor fit
 for the eBPF verifier's bounded execution model, so parsing happens
 entirely in userspace (`bathyscaphe::dns::parse`), using the raw captured
@@ -99,17 +107,23 @@ container's actual connectivity.
   residual limitation list" for exactly which attribution paths remain
   uncorrelated (an uncorrelated response still falls back to this
   chunk's original, possibly-wrong, attribution, marked low-confidence).
-- **Spoofing**: `dns_snoop` trusts *any* UDP:53-sourced datagram reaching
-  the container's ingress path -- there is no allow-list of trusted
-  resolver addresses (unlike Calico/NSX's explicit "trusted DNS servers"
-  restriction, see `prior_art_fqdn.md`). A process able to inject a UDP
-  datagram into the same network namespace with a spoofed source port
-  could poison the domain cache this layer feeds. In THIS chunk that is
-  purely a display/enrichment integrity concern (a misleading `domain.name`
-  on an event, nothing more); it becomes a policy-relevant concern the
-  moment chunk #10 starts inserting cache-derived IPs into the
-  enforcement allow-map, and is the right point to revisit whether a
-  trusted-resolver restriction is worth adding.
+- **Spoofing (mitigated for the trusted-resolver path as of build chunk
+  #11)**: `dns_snoop` still CAPTURES *any* UDP:53-sourced datagram reaching
+  the container's ingress path -- capture itself has no opinion on trust,
+  matching every other kernel-side program in this codebase. What changed:
+  userspace now checks every captured response's own source address
+  against an operator-configured trusted-resolver allowlist
+  (`bathyscaphe::dns::trust::TrustedResolvers`, see "Build chunk #11" below)
+  BEFORE using it to seed enforcement. A process able to inject a spoofed
+  UDP:53 reply into the same network namespace can still poison the
+  ENRICHMENT cache (a misleading `domain.name`, always floored to
+  `Inferred` confidence when untrusted -- see below), but can no longer buy
+  its way onto a container's `POLICY` allow-map that way: an untrusted
+  answer is never used for that. Residual, explicitly out of scope for
+  chunk #11: poisoning a resolver that IS in the trusted set (cache
+  poisoning an upstream DNS server this host's operator already trusts) is
+  a DNS-protocol-level attack this project does not attempt to defend
+  against, matching every DNS-snooping tool `prior_art_fqdn.md` surveys.
 
 ### Why `domain` is null on an event
 
@@ -487,9 +501,160 @@ limitation, not silently assumed away.
 `Observe`. Per `docs/PROTOCOL.md` section 2, this means a `policy`
 directive's `type: "name"` rules are no longer at risk of the sticky
 "requested a capability this build doesn't have" validation error --
-airlock can rely on them being genuinely enforced.
+airlock can rely on them being genuinely enforced. Build chunk #11 adds no
+new capability of its own -- the trusted-resolver check and name-based
+deny are both refinements of what `enforce_fqdn` already means, not a
+separately-advertised feature; the capability set this build advertises
+(`observe`, `enforce`, `enforce_udp`, `dns_enrich`, `enforce_fqdn`) is
+unchanged from chunk #10.
 
-## Full residual limitation list (chunks #9 + #10, honest and complete)
+## Build chunk #11: trusted-resolver enforcement and name-based deny
+
+### The trusted-resolver allowlist (Part A)
+
+Every DNS-snooping tool `prior_art_fqdn.md` surveys in the cloud-native
+camp (Calico, NSX) restricts which resolver addresses it trusts before
+acting on a snooped answer; chunks #9-#10 shipped without one, explicitly
+flagged as the next thing worth revisiting once enforcement started acting
+on snooped answers (chunk #10's own "Spoofing" residual limitation). Chunk
+#11 closes it: `bathyscaphe::dns::trust::TrustedResolvers` is an
+operator-configured set of resolver addresses, and
+`crate::dns::capture_callback` checks every captured response's own
+`src_addr` (see "What is captured, and how" above) against it, producing a `trusted:
+bool` on `AttributedAnswer` that `daemon::fqdn::on_dns_answer` (the
+enforcement gate) checks before ever calling `ProbeApi::set_policy`.
+
+**The default set** (`TrustedResolvers::default_at`, built by
+`cli::run_cmd::build_config` from `/etc/resolv.conf` at process start):
+
+- `127.0.0.11` (`bathyscaphe::dns::trust::DOCKER_EMBEDDED_DNS`) --
+  unconditionally, always. `bathyscaphe-ebpf::dns_query`'s own empirical
+  investigation (chunk #10, "Docker's embedded-DNS DNAT rewrite" above)
+  already established that Docker's per-container-network-namespace DNAT
+  rule rewrites the DESTINATION PORT of a query addressed to
+  `127.0.0.11:53` but never the address -- the address is a reliable,
+  NAT-invariant signal specifically for this one well-known resolver, and
+  by the same DNAT symmetry, the RESPONSE's own source address genuinely
+  reads back as `127.0.0.11` too (proven live against a real container on
+  a real user-defined bridge network -- `docs/TESTING.md` has the
+  `bathyscaphe-itest-dns-src-addr-smoke` live-smoke test's raw captured
+  bytes). This makes `127.0.0.11` the canonical trusted source for any
+  container using Docker's embedded resolver, unconditionally, not merely
+  a configurable convenience.
+- Every `nameserver` line in the host's own `/etc/resolv.conf`
+  (`bathyscaphe::dns::trust::parse_resolv_conf_nameservers`): the
+  reasoning is that a container reaching one of ITS HOST's own configured
+  upstream resolvers directly (bypassing Docker's embedded resolver
+  entirely -- possible on a container with a custom `--dns` flag, or one
+  attached to the host's network namespace) is using a resolver the
+  operator already implicitly trusts for every other purpose on this host.
+
+**Operator extension**: `--trusted-resolver <ip>` (repeatable,
+`cli::RunArgs::trusted_resolver`) adds addresses on top of the default
+set. There is deliberately no flag or code path anywhere in
+`bathyscaphe::dns::trust` that trusts everything by default -- the build
+brief's explicit instruction ("Do NOT default to trust-everything") is
+enforced by construction: `TrustedResolvers::new([])` starts empty, and
+every other constructor only ever ADDS specific, named addresses.
+
+**The fail-closed direction**: a container using a resolver OUTSIDE the
+trusted set (a public resolver reached directly, an operator-unconfigured
+internal one) simply never gets a name rule's resolved IPs seeded into its
+allow-map. In `mode: block`, that falls straight back to the container's
+ordinary IP/CIDR default (normally deny) -- an over-block an operator will
+notice and can fix with `--trusted-resolver`, never a silent widening an
+attacker could exploit. `cli::run_cmd::run` logs the resolved trusted set
+at startup, and warns loudly (`cli.run.no_resolv_conf_nameservers`) when
+`/etc/resolv.conf` yielded zero nameservers, and again, more severely
+(`cli.run.trusted_resolvers_empty`), on the pathological case where the
+whole resolved set is somehow empty -- both per the build brief's "if the
+resolved default set is empty, warn loudly" instruction.
+
+### The loud potential-spoofing signal: `dns.untrusted_answer`
+
+When an untrusted-sourced answer WOULD have matched a container's active
+`Allow` name pattern (the pattern match is still evaluated even though the
+answer is never used for enforcement), `daemon::fqdn::on_dns_answer` emits
+a throttled (same shared token bucket as every other R1 loud record)
+`security` record, `reason: dns.untrusted_answer`,
+`severity: Warning`, carrying `resolver.addr` (the untrusted source) and
+`domain` (the name that would have matched) as attributes
+(`daemon::security::dns_untrusted_answer_record`). This is the
+differentiator the build brief asked for: a container's own resolver (or
+something able to inject traffic into its network namespace) answering an
+allow-listed hostname from a source outside the operator's trusted set is
+exactly the spoofing attempt a trusted-resolver allowlist exists to
+defeat, and it is now visible rather than silently absorbed. A
+would-have-matched `Deny` pattern from an untrusted source is deliberately
+NOT reported the same way -- failing to enforce a deny an attacker was
+trying to defeat by spoofing is a strictly safer outcome than the
+allow-spoofing case, so it does not carry the same urgency.
+
+### Enrichment versus enforcement trust: the choice this chunk makes
+
+The build brief drew a distinction: enforcement (seeding `POLICY`) MUST
+gate on trust, but enrichment (`DomainCache`, feeding `domain.*` on
+regular connect events) MAY still record an untrusted answer, as long as
+it is tagged low-confidence so it never silently looks authoritative. This
+build's choice: `DomainCache::record` now takes the same `trusted` bit and
+FLOORS the entry's confidence at
+`DomainConfidence::Inferred` (see "The per-container IP -> domain cache"
+above) regardless of how fresh the answer's own TTL says it is -- an untrusted
+answer can still put a name on an event (more useful to an operator
+skimming bilgeline logs than a null one), but it can never read as
+`Asserted`, the wire's strongest confidence value, which stays reserved
+for answers this build actually trusts. This is a deliberate widening of
+`DomainConfidence`'s existing "less certain past TTL" meaning to also
+cover "less certain because untrusted", rather than adding a new wire enum
+variant for it -- the frozen protocol gains no new value, and the existing
+`Inferred` semantics ("don't treat this as gospel") already fit an
+untrusted answer's honest epistemic status. A future chunk with a real
+need to distinguish "stale but trusted" from "fresh but untrusted" could
+revisit this; chunk #11 judges the collapse acceptable rather than
+warranting a wire change.
+
+### Name-based DENY enforcement (Part B)
+
+Chunk #10 shipped `NamePatternStore` accepting and storing a `deny`-action
+name rule (never silently dropped or miscounted as inert) but never
+actually enforcing it -- flagged as a residual limitation at the time.
+Chunk #11 closes it: on a TRUSTED DNS answer matching an active `Deny`
+pattern (`NamePatternStore::first_matching_deny`, checked BEFORE the
+`Allow` check), `daemon::fqdn::on_dns_answer` inserts the resolved address
+into `POLICY` as a `/128` host route with `action: Deny`, `source:
+RuleSource::Dns`, and the same `expires_at_ns` derivation (and the same
+`probe::policy::PolicyStore::reap_expired` TTL/reaper handling) the
+`Allow` path has used since chunk #10 -- no separate lifecycle for a deny
+route. A pattern carrying a port/proto constraint applies it symmetrically
+to the `Allow` case: an unconstrained `Deny` pattern blocks the address
+entirely (`cidr_default_action: Deny`, no port rules); a `Deny` pattern
+scoped to a specific port/proto instead defaults the address's OTHER ports
+to `Allow` and denies only the named port/proto -- a name-based deny means
+"block this address on this port", never "block this address entirely"
+once a port/proto constraint narrows it.
+
+**Deny wins**: if the same answer matches BOTH an active `Allow` pattern
+and an active `Deny` pattern for a container (a container can legitimately
+register both, e.g. a broad `*.example.com` allow alongside a narrower
+`evil.example.com` deny), the deny match is checked first and, if present,
+is the ONLY thing inserted -- the allow match is ignored entirely, never
+producing a second, conflicting `POLICY` entry for the same address. This
+matches `docs/PROTOCOL.md`'s wire-level "deny wins at equal specificity"
+rule, extended here to name rules.
+
+**The limitation, stated plainly**: this only ever blocks an IP this build
+actually SAW via a TRUSTED DNS answer -- the exact same best-effort
+envelope the `Allow` path has carried since chunk #10. A container that
+never resolves the denied name through a visible, trusted path (DoH/DoT,
+an untrusted resolver, or simply never looking it up because it already
+knows the IP) is not blocked by the name rule at all; IP/CIDR policy
+remains the hard floor an operator relies on for a deny that MUST hold
+regardless of how the destination was reached. A name-based deny is a
+best-effort narrowing on top of that floor, exactly like a name-based
+allow is a best-effort widening on top of it -- never a substitute for
+either.
+
+## Full residual limitation list (chunks #9-#11, honest and complete)
 
 IP/CIDR policy is the ground-truth floor throughout; every limitation
 below describes when FQDN enforcement's best-effort layer has nothing to
@@ -531,21 +696,27 @@ add, never a case where IP/CIDR enforcement itself is compromised.
   matching more than one registered pattern for a container uses
   whichever pattern compiled first; their port/proto constraints are never
   merged.
-- **A `deny`-action name rule is registered but not actively enforced**:
-  `NamePatternStore` accepts and stores it (never silently dropped or
-  miscounted as inert), but nothing in this chunk inserts a corresponding
-  DENY entry anywhere -- enforcing a name-based deny would need to block
-  the resolved IP HARDER than whatever broader policy already says, which
-  this chunk's insertion path does not attempt. Deferred.
+- **A name-based deny only blocks IPs actually seen via a trusted DNS
+  answer** (build chunk #11 closed the "not enforced at all" gap chunk #10
+  left open, but the enforcement itself keeps the same best-effort
+  envelope the `Allow` path has always had): see "Build chunk #11" above,
+  "Name-based DENY enforcement", for the full statement. IP/CIDR policy
+  remains the hard floor a deny that MUST hold regardless of DNS
+  visibility has to rely on.
 - **`policy.name_unresolved_block`'s heuristic imprecision**: documented
   in its own section above -- it can fire on an unrelated CIDR-policy
   deny, not exclusively on a genuinely name-rule-intended one.
-- **Spoofing**: unchanged from chunk #9 -- `dns_snoop` trusts any
-  UDP:53-sourced datagram with no trusted-resolver allowlist. This matters
-  MORE now that chunk #10 actually inserts allow-map entries from what it
-  observes: a process able to inject a spoofed UDP:53 response into the
-  same netns could, if it also managed to have a matching query recorded
-  in the pending table (or land as an uncorrelated fallback), cause an
-  unintended IP to be added to a container's allow-map. Revisiting a
-  trusted-resolver restriction remains the documented, not-yet-taken next
-  step chunk #9 already flagged.
+- **Spoofing is mitigated for the trusted-resolver path, not eliminated as
+  a DNS-protocol concern**: build chunk #11's trusted-resolver allowlist
+  (see "Build chunk #11" above) means an untrusted-sourced answer can no
+  longer seed `POLICY`, closing the specific gap chunk #9/#10 flagged
+  here. What remains explicitly out of scope, matching every DNS-snooping
+  tool `prior_art_fqdn.md` surveys: cache-poisoning a resolver that IS in
+  the trusted set (an upstream DNS server this host's operator already
+  configured and implicitly trusts) is a DNS-protocol-level attack this
+  project does not attempt to defend against -- trusting a resolver's
+  ADDRESS says nothing about whether that resolver's own upstream answers
+  are themselves being poisoned. DoH/DoT/ECH and direct-IP egress remain
+  the other two documented ways a container can evade name-rule policy
+  entirely, with IP/CIDR staying the hard floor beneath all three, exactly
+  as `bathy_build_spec.md`'s BUILD-THROUGH STANCE requires.

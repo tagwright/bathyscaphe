@@ -46,6 +46,29 @@
 //! grace window, a lookup returns `None` -- identical, from the caller's
 //! perspective, to a cache miss (`docs/DNS.md`'s "why `domain` is null"
 //! list does not distinguish the two).
+//!
+//! ## Trust flooring (build chunk #11)
+//!
+//! [`DomainCache::record`] takes a `trusted` bit (from
+//! `crate::dns::AttributedAnswer::trusted`, ultimately
+//! `crate::dns::trust::TrustedResolvers::is_trusted` on the answer's own
+//! captured source address). An answer from an UNTRUSTED source is still
+//! recorded here -- this cache exists purely for display/enrichment, a
+//! materially lower-stakes consumer than `POLICY` enforcement
+//! (`daemon::fqdn::on_dns_answer` gates enforcement on trust directly and
+//! never even calls into this module for an untrusted answer's
+//! insertion) -- but its confidence is FLOORED at
+//! [`bathyscaphe_proto::DomainConfidence::Inferred`] regardless of how
+//! fresh the answer's own TTL says it is, so an untrusted-sourced
+//! `domain.name` on a wire event never silently reads as
+//! [`bathyscaphe_proto::DomainConfidence::Asserted`] -- the wire's
+//! strongest confidence value is reserved for answers this build actually
+//! trusts. See `docs/DNS.md`'s "enforcement versus enrichment trust"
+//! section for why this cache still records an untrusted answer at all
+//! rather than discarding it outright: a possibly-spoofed `domain.name` on
+//! an event, clearly marked `Inferred`, is still more useful to an
+//! operator reading `bilgeline` logs than a null one, and enrichment never
+//! gates a verdict the way `POLICY` does.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -85,6 +108,11 @@ struct CacheEntry {
     /// treats the entry as gone and [`DomainCache::record`]'s
     /// opportunistic sweep (see that method's doc) removes it.
     purge_at_ns: u64,
+    /// Build chunk #11: whether this answer arrived from a trusted
+    /// resolver. `false` floors [`DomainCache::lookup`]'s confidence at
+    /// [`DomainConfidence::Inferred`] regardless of TTL freshness -- see
+    /// this module's "Trust flooring" doc section.
+    trusted: bool,
 }
 
 /// One successful [`DomainCache::lookup`].
@@ -114,7 +142,9 @@ impl DomainCache {
     /// `ttl_secs` seconds from `now_boottime_ns`. Overwrites any prior
     /// mapping for the same `(cgroup_id, addr)` -- the most recently
     /// observed answer wins, matching every DNS-snooping prior-art tool
-    /// surveyed in `prior_art_fqdn.md`.
+    /// surveyed in `prior_art_fqdn.md`. `trusted` (build chunk #11, see
+    /// this module's "Trust flooring" doc section) is carried onto the
+    /// stored entry and consulted only at lookup time.
     ///
     /// Also opportunistically sweeps this SAME container's entries that
     /// are past their grace window (see [`STALE_GRACE_NS`]) on every call
@@ -127,11 +157,11 @@ impl DomainCache {
     /// as an accepted v1 gap, not a silent unbounded leak (the leak is
     /// bounded by "however many distinct addresses this one container
     /// ever resolved," not host-wide).
-    pub fn record(&mut self, cgroup_id: u64, domain: String, addr: IpAddr, ttl_secs: u32, now_boottime_ns: u64) {
+    pub fn record(&mut self, cgroup_id: u64, domain: String, addr: IpAddr, ttl_secs: u32, now_boottime_ns: u64, trusted: bool) {
         let expires_at_ns = expiry_ns(now_boottime_ns, ttl_secs);
         let purge_at_ns = expires_at_ns.saturating_add(STALE_GRACE_NS);
         let container = self.by_container.entry(cgroup_id).or_default();
-        container.insert(addr, CacheEntry { domain, expires_at_ns, purge_at_ns });
+        container.insert(addr, CacheEntry { domain, expires_at_ns, purge_at_ns, trusted });
         container.retain(|_, entry| entry.purge_at_ns > now_boottime_ns);
     }
 
@@ -144,12 +174,15 @@ impl DomainCache {
     ///
     /// `None` on a miss, or on an entry past [`STALE_GRACE_NS`] -- see
     /// this module's doc on why the two are indistinguishable to callers.
+    /// An entry recorded as untrusted (build chunk #11) never returns
+    /// [`DomainConfidence::Asserted`], regardless of TTL freshness -- see
+    /// this module's "Trust flooring" doc section.
     pub fn lookup(&self, cgroup_id: u64, addr: IpAddr, now_boottime_ns: u64) -> Option<DomainHit> {
         let entry = self.by_container.get(&cgroup_id)?.get(&addr)?;
         if now_boottime_ns >= entry.purge_at_ns {
             return None;
         }
-        let confidence = if now_boottime_ns < entry.expires_at_ns { DomainConfidence::Asserted } else { DomainConfidence::Inferred };
+        let confidence = if entry.trusted && now_boottime_ns < entry.expires_at_ns { DomainConfidence::Asserted } else { DomainConfidence::Inferred };
         Some(DomainHit { name: entry.domain.clone(), confidence })
     }
 
@@ -176,7 +209,7 @@ mod tests {
     #[test]
     fn a_fresh_record_is_asserted() {
         let mut cache = DomainCache::new();
-        cache.record(1, "example.com".to_string(), addr(), 300, 1_000_000_000);
+        cache.record(1, "example.com".to_string(), addr(), 300, 1_000_000_000, true);
         let hit = cache.lookup(1, addr(), 1_000_000_000).expect("just-recorded entry should hit");
         assert_eq!(hit.name, "example.com");
         assert_eq!(hit.confidence, DomainConfidence::Asserted);
@@ -186,7 +219,7 @@ mod tests {
     fn a_lookup_still_within_ttl_stays_asserted() {
         let mut cache = DomainCache::new();
         let now = 1_000_000_000u64;
-        cache.record(1, "example.com".to_string(), addr(), 300, now);
+        cache.record(1, "example.com".to_string(), addr(), 300, now, true);
         let almost_expired = now + 299 * 1_000_000_000;
         let hit = cache.lookup(1, addr(), almost_expired).unwrap();
         assert_eq!(hit.confidence, DomainConfidence::Asserted);
@@ -196,7 +229,7 @@ mod tests {
     fn a_lookup_past_ttl_but_within_grace_is_inferred() {
         let mut cache = DomainCache::new();
         let now = 1_000_000_000u64;
-        cache.record(1, "example.com".to_string(), addr(), 300, now);
+        cache.record(1, "example.com".to_string(), addr(), 300, now, true);
         let just_past_ttl = now + 300 * 1_000_000_000 + 1;
         let hit = cache.lookup(1, addr(), just_past_ttl).expect("just past TTL should still hit, as Inferred");
         assert_eq!(hit.confidence, DomainConfidence::Inferred);
@@ -206,7 +239,7 @@ mod tests {
     fn a_lookup_past_the_grace_window_is_none() {
         let mut cache = DomainCache::new();
         let now = 1_000_000_000u64;
-        cache.record(1, "example.com".to_string(), addr(), 300, now);
+        cache.record(1, "example.com".to_string(), addr(), 300, now, true);
         let expires_at = now + 300 * 1_000_000_000;
         let past_grace = expires_at + STALE_GRACE_NS + 1;
         assert_eq!(cache.lookup(1, addr(), past_grace), None);
@@ -215,15 +248,15 @@ mod tests {
     #[test]
     fn a_different_container_never_sees_another_containers_entry() {
         let mut cache = DomainCache::new();
-        cache.record(1, "example.com".to_string(), addr(), 300, 0);
+        cache.record(1, "example.com".to_string(), addr(), 300, 0, true);
         assert_eq!(cache.lookup(2, addr(), 0), None);
     }
 
     #[test]
     fn recording_again_for_the_same_key_overwrites_the_prior_answer() {
         let mut cache = DomainCache::new();
-        cache.record(1, "old.example.com".to_string(), addr(), 300, 0);
-        cache.record(1, "new.example.com".to_string(), addr(), 300, 0);
+        cache.record(1, "old.example.com".to_string(), addr(), 300, 0, true);
+        cache.record(1, "new.example.com".to_string(), addr(), 300, 0, true);
         let hit = cache.lookup(1, addr(), 0).unwrap();
         assert_eq!(hit.name, "new.example.com");
     }
@@ -232,16 +265,60 @@ mod tests {
     fn record_opportunistically_sweeps_this_containers_own_entries_past_grace() {
         let mut cache = DomainCache::new();
         let short_lived = IpAddr::from([10, 0, 0, 1]);
-        cache.record(1, "short.example.com".to_string(), short_lived, 1, 0);
+        cache.record(1, "short.example.com".to_string(), short_lived, 1, 0, true);
         assert_eq!(cache.container_entry_count(1), 1);
 
         // Far past that first entry's grace window; recording a second,
         // unrelated address for the SAME container should sweep it.
         let long_after = 1 * 1_000_000_000 + STALE_GRACE_NS + 1;
-        cache.record(1, "other.example.com".to_string(), addr(), 300, long_after);
+        cache.record(1, "other.example.com".to_string(), addr(), 300, long_after, true);
 
         assert_eq!(cache.container_entry_count(1), 1, "the expired-past-grace entry should have been swept");
         assert_eq!(cache.lookup(1, short_lived, long_after), None);
         assert!(cache.lookup(1, addr(), long_after).is_some());
+    }
+
+    #[test]
+    fn an_untrusted_fresh_record_is_inferred_not_asserted() {
+        // Build chunk #11: even a perfectly fresh, well-within-TTL answer
+        // must never read as Asserted when it came from an untrusted
+        // source -- see this module's "Trust flooring" doc section.
+        let mut cache = DomainCache::new();
+        cache.record(1, "example.com".to_string(), addr(), 300, 1_000_000_000, false);
+        let hit = cache.lookup(1, addr(), 1_000_000_000).expect("an untrusted answer is still recorded for enrichment");
+        assert_eq!(hit.confidence, DomainConfidence::Inferred);
+    }
+
+    #[test]
+    fn an_untrusted_record_past_ttl_is_still_just_inferred() {
+        let mut cache = DomainCache::new();
+        let now = 1_000_000_000u64;
+        cache.record(1, "example.com".to_string(), addr(), 300, now, false);
+        let just_past_ttl = now + 300 * 1_000_000_000 + 1;
+        let hit = cache.lookup(1, addr(), just_past_ttl).expect("still within the grace window");
+        assert_eq!(hit.confidence, DomainConfidence::Inferred);
+    }
+
+    #[test]
+    fn an_untrusted_record_still_expires_past_the_grace_window() {
+        // Trust flooring only ever LOWERS confidence -- it must not exempt
+        // an untrusted entry from the same purge/grace lifecycle every
+        // other entry follows.
+        let mut cache = DomainCache::new();
+        let now = 1_000_000_000u64;
+        cache.record(1, "example.com".to_string(), addr(), 300, now, false);
+        let expires_at = now + 300 * 1_000_000_000;
+        let past_grace = expires_at + STALE_GRACE_NS + 1;
+        assert_eq!(cache.lookup(1, addr(), past_grace), None);
+    }
+
+    #[test]
+    fn overwriting_a_trusted_record_with_an_untrusted_one_drops_the_confidence() {
+        let mut cache = DomainCache::new();
+        cache.record(1, "example.com".to_string(), addr(), 300, 0, true);
+        assert_eq!(cache.lookup(1, addr(), 0).unwrap().confidence, DomainConfidence::Asserted);
+
+        cache.record(1, "example.com".to_string(), addr(), 300, 0, false);
+        assert_eq!(cache.lookup(1, addr(), 0).unwrap().confidence, DomainConfidence::Inferred, "the most recently observed answer's own trust must win, exactly like its name/TTL already do");
     }
 }

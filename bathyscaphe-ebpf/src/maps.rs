@@ -29,7 +29,7 @@ const TAMPER_MAX_ENTRIES: u32 = 4096;
 const EVENTS_BYTE_SIZE: u32 = 256 * 1024;
 /// 128 KiB, same page-alignment requirement as [`EVENTS_BYTE_SIZE`].
 /// Smaller than `EVENTS` despite each record being larger
-/// (`DnsCapture::WIRE_SIZE` is 536 bytes versus `Event::WIRE_SIZE`'s 88):
+/// (`DnsCapture::WIRE_SIZE` is 552 bytes versus `Event::WIRE_SIZE`'s 88):
 /// DNS response traffic is far lower-frequency than connect/sendmsg
 /// traffic for any real container, and a placeholder chosen independently
 /// of the `EVENTS` sizing on purpose -- see `bathyscaphe_common::dns`'s

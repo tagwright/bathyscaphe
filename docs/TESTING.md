@@ -640,3 +640,180 @@ were removed after use. The test's own throwaway container
 were removed as part of its own teardown on every run; confirmed absent
 via the Docker API afterward. `/sys/fs/bpf` confirmed empty after the
 final run (the test's own `unpin_all` call).
+
+## What chunk #11 (trusted-resolver enforcement + name-based deny) proved
+
+### Unprivileged, no kernel/bpffs/cgroup access required
+
+- `dns::trust::tests` (`bathyscaphe`'s own `dns/trust.rs`):
+  `parse_resolv_conf_nameservers` against a range of
+  `resolv.conf`-shaped text (comments, unrelated directives, IPv6
+  nameservers, a malformed address skipped rather than fatal), and
+  `TrustedResolvers`'s default-set construction, `with_extra`, and the
+  explicit "an empty set trusts nothing, never trust-everything" property.
+- `dns::cache::tests`: the new `trusted` bit on `DomainCache::record`
+  floors confidence at `Inferred` regardless of TTL freshness, including
+  the "overwriting a trusted record with an untrusted one drops the
+  confidence" ordering case.
+- `dns::tests::capture_callback_marks_an_answer_from_an_untrusted_source_as_untrusted`:
+  `capture_callback`'s new `trusted_resolvers` parameter actually gates
+  the bit forwarded to both the cache and `AttributedAnswer`, using a
+  hand-built real DNS response payload exactly like chunk #10's own
+  correlation tests.
+- `daemon::fqdn::tests` (ten new/updated tests): the full enforcement gate
+  -- an untrusted answer never calls `ProbeApi::set_policy` even on a
+  matching allow pattern; the `dns.untrusted_answer` loud record fires
+  exactly once for that case and stays quiet on a non-matching or
+  deny-only untrusted answer; a trusted answer matching an active `Deny`
+  pattern inserts a deny host route (unconstrained and port/proto-scoped
+  variants both covered); deny wins over an allow pattern matching the
+  same answer, inserting exactly one host route, never two.
+- `dns::patterns::tests`: `first_matching_deny` (mirrors
+  `first_matching_allow` exactly) plus a test proving a name can match
+  both an allow and a deny pattern independently, leaving the winner
+  decision to `daemon::fqdn::on_dns_answer`.
+- `daemon::security::tests::dns_untrusted_answer_record_is_warning_severity_and_carries_the_reason`:
+  the new record builder's shape (severity, `reason`, `resolver.addr`,
+  `domain` attributes).
+- `cli::tests` (`run_parses_repeated_trusted_resolver_flags`,
+  `run_rejects_a_malformed_trusted_resolver_address`,
+  `run_defaults_to_no_extra_trusted_resolvers`) and `cli::run_cmd::tests`
+  (`build_config_carries_the_given_trusted_resolvers_through_verbatim`):
+  the `--trusted-resolver` flag parses, repeats, rejects a malformed
+  address, and threads through to `DaemonConfig` unmodified.
+- `bathyscaphe-common::dns::tests`: `DnsCapture`'s new pinned size (552
+  bytes: the original 536 plus the 16-byte `src_addr` field) and that
+  `src_addr` round-trips through `zeroed_for`/direct field assignment
+  exactly like `dst_port` already did.
+- **The pre-existing bug this chunk's build brief asked to fix** (Part C):
+  `daemon::apply::tests::make_before_break_diff_removes_stale_keys_not_in_the_new_snapshot`
+  was missing a `probe.seed_path(...)` call before its first
+  `apply_policy`. Without it, `MockProbe::attach_container` invents its
+  own cgroup id for the unseeded path (rather than the id the test's own
+  `lookup_with_one_container` claims), so the test's SECOND
+  `apply_policy` call re-attempts an attach under a path that now maps to
+  an ALREADY-attached mock id, `MockProbe::attach_container` returns
+  `Err("already attached")`, and the second `apply_policy` returns
+  `PolicyAckStatus::Error` WITHOUT ever calling `apply_make_before_break`
+  at all. The test's two assertions then passed by coincidence rather than
+  by exercising the diff: the length check (`== 2`) matched the STALE
+  first-generation entry count (also 2), and the ordering check's
+  `|| first_remove.is_none()` clause short-circuited true because no
+  `RemovePolicyKey` call had ever happened. A SECOND, independent bug
+  surfaced once the missing `seed_path` was added and the diff actually
+  ran for the first time: the ordering assertion's comparison itself was
+  backwards (`last_set > first_remove` instead of `last_set < first_remove`
+  for "insert happens before remove"), which the missing-seed_path bug had
+  been silently protecting from ever being exercised. Both are fixed
+  together; the test now asserts the actual applied ack status
+  (`PolicyAckStatus::Applied`) on both pushes, checks the SPECIFIC surviving
+  and removed keys (not just a count), and a `first_remove.is_some()`
+  assertion that fails loudly if the diff ever again stops running.
+
+### eBPF build: verifier acceptance of the new source-address reads
+
+`bathyscaphe-ebpf::dns::try_dns_snoop_v4`/`try_dns_snoop_v6` gained two new
+fixed-offset loads (IPv4 header bytes 12-15, IPv6 fixed-header bytes 8-23)
+threaded through to `capture_if_dns_response`'s new `src_addr: [u8; 16]`
+parameter, written into the `DnsCapture` record alongside `dst_port`. Built
+clean via the same `bathyscaphe-itest-harden` container this chunk's other
+work used (`rust:1-bookworm`, nightly + `rust-src`, `bpf-linker` 0.11.0 per
+`docs/BUILDING.md`); `cargo build` succeeded with the usual harmless
+warnings only, and `readelf`-level section inspection was not re-run since
+chunk #9/#10 already established the toolchain proves this reliably and
+the privileged smoke test below is the more decisive proof for THIS
+chunk's specific change (the verifier accepting the two new loads is a
+precondition for `attach_container` succeeding at all, which the smoke
+test below hard-fails on if it doesn't).
+
+### Privileged smoke test -- FULL PROOF, precisely
+
+**What ran**: `probe::dns::live_smoke::dns_snoop_captures_the_responses_own_source_address`
+(`#[ignore]`d by default, same convention as every other `live_smoke`
+test), run inside `bathyscaphe-itest-harden` with `--privileged
+--cgroupns=host` and `/var/run/docker.sock` bind-mounted, against a real
+Docker container (`bathyscaphe-itest-dns-src-addr-smoke`, alpine, looping
+`nslookup example.com` every second for 10s) on a real user-defined bridge
+network (`bathyscaphe-itest-dns-net`, the same network chunk #9's own test
+uses -- only a real user-defined network gets Docker's embedded resolver),
+kernel 6.8.0-136 (matching the host). The test loops `nslookup` repeatedly
+(unlike chunk #9's single-shot query) specifically to give
+`attach_container` a comfortable window to land before at least one query
+fires, avoiding a startup-race false negative.
+
+Deliberately narrow success criterion, matching every other `live_smoke`
+test's "do not rabbit-hole" posture: this test does NOT require
+`parse_dns_response` to succeed on the captured payload (see "what this
+run additionally found" below for why) -- only that `dns_snoop` captures
+ONE real item with a nonzero length, from which `src_addr` is read.
+
+**Result**: `test probe::dns::live_smoke::dns_snoop_captures_the_responses_own_source_address
+... ok`, with:
+
+```
+dns live_smoke (src_addr): full proof -- captured src_addr 127.0.0.11 is Docker's embedded resolver, and the default trusted-resolver set trusts it, exactly as docs/DNS.md describes
+```
+
+This decisively proves, on a real kernel against a real container's real
+DNS traffic:
+
+- The verifier ACCEPTS `dns_snoop`'s two new source-address reads for both
+  the IPv4 and IPv6 paths (only the IPv4 path was exercised live here, but
+  both compiled and passed the SAME verifier pass in the eBPF build step
+  above), and `attach_container` succeeds.
+- `DnsCapture::src_addr` captures the REAL responding resolver's address,
+  correctly RFC-4291-embedded (`00*10, ff, ff, 7f, 00, 00, 0b` observed
+  raw, unmapping to `127.0.0.11` exactly).
+- `TrustedResolvers::default_set_from` (the built-in default, no
+  `--trusted-resolver` needed) actually trusts that captured address --
+  end to end, the default configuration this chunk ships would have
+  seeded enforcement from this exact real answer, had a name rule been
+  registered for it.
+
+**What this run additionally found (an orthogonal, pre-existing
+characteristic, not a chunk #11 defect)**: every captured item in this
+run's raw traffic had its payload truncated at the 32- or 64-byte tier
+(`bathyscaphe-ebpf::dns`'s tiered `bpf_skb_load_bytes` load, chunk #9),
+short of the full two-answer (A+CNAME or dual-AAAA) response `example.com`
+actually returns on this network path -- `payload_len_hint` (the UDP
+header's own trusted length) exceeded every tier that successfully loaded
+except the smallest ones, because this specific container/network path's
+packets carry no trailing padding beyond their real, modest payload size,
+and no tier between 65 and 127 bytes exists. `parse_dns_response`
+therefore returned `None` for every captured item in this run, even though
+`dns_snoop` and `src_addr` capture both worked perfectly. This is
+`bathyscaphe-ebpf::dns`'s own documented "tier-granular length, not exact"
+characteristic (chunk #9, `docs/DNS.md`) manifesting for a response size
+that happens to fall in a gap between adjacent tiers -- unrelated to
+`src_addr`, not something chunk #11 introduced or needs to fix, and worth
+a future chunk narrowing the tier ladder (e.g. adding a 96-byte tier)
+if this proves common in practice. Recorded here rather than silently
+worked around, per this document's own honesty mandate.
+
+**Cleanup**: `bathyscaphe-itest-harden` was removed after use, along with
+the named `bathyscaphe-itest-cargo-registry` volume it used to cache the
+crates.io registry across rebuilds within the same session. The test's own
+throwaway container (`bathyscaphe-itest-dns-src-addr-smoke`) and network
+(`bathyscaphe-itest-dns-net`) were removed as part of its own teardown;
+confirmed absent via the Docker API afterward. `/sys/fs/bpf` confirmed
+empty after the final run (the test's own `unpin_all` call).
+
+### What is still deferred to a later chunk
+
+A full end-to-end integration proof that a container configured to use an
+UNTRUSTED resolver (a custom `--dns` flag pointing at a resolver outside
+the default set, with a real `policy` directive pushed through
+`daemon::apply::apply_policy` and a real connect attempt afterward)
+genuinely fails to have its allow-map seeded, and that the connect is
+denied in `mode: block`, was judged out of scope for this chunk's
+timeboxed privileged check -- it needs the FULL daemon wired up as a
+subprocess speaking the NDJSON protocol (hello/start/policy/directive
+loop), not just a loaded probe, which is next-chunk integration-harness
+territory per the build brief's own "full integration is the next chunk"
+scoping. The trust-gating LOGIC itself (an untrusted answer never reaches
+`ProbeApi::set_policy`) is already fully proven without a kernel by
+`daemon::fqdn::tests::on_dns_answer_never_seeds_policy_from_an_untrusted_answer`;
+what remains unproven live is only the plumbing from "a container's actual
+DNS traffic" through to "the daemon's directive loop sees it," which
+chunk #10's own query/response correlation live-smoke test already proves
+for the trusted case.

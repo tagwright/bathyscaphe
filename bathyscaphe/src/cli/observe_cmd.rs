@@ -52,7 +52,7 @@ use std::time::Duration;
 use bathyscaphe_proto::UpMessage;
 
 use crate::attribution::{AttributionService, Attributor, Resolver};
-use crate::dns::{DomainCache, PendingQueryTable};
+use crate::dns::{DomainCache, PendingQueryTable, TrustedResolvers};
 use crate::pipeline::{EventSink, Pipeline};
 use crate::probe::layout::{PinPaths, PinState, pin_state};
 use crate::probe::{DnsCaptureConsumer, DnsQueryCaptureConsumer, EventConsumer, Probe};
@@ -161,6 +161,13 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
     // only ever consumes the corrected cgroup_id for cache attribution,
     // never for a POLICY insertion.
     let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
+    // Build chunk #11: `observe` never enforces (no policy directives at
+    // all), but the trusted-resolver check still gates whether an answer's
+    // enrichment confidence can read as Asserted (`docs/DNS.md`'s
+    // enforcement-vs-enrichment trust section) -- the same real-host
+    // default `run` uses, so `observe`'s printed `domain.confidence`
+    // matches what `run` would have recorded for the identical traffic.
+    let trusted_resolvers = Arc::new(TrustedResolvers::default_at(std::path::Path::new("/etc/resolv.conf")));
     let sink = ObservePrinter { format: args.format, container_filter: args.container.clone() };
     let pipeline = match Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), sink) {
         Ok(pipeline) => pipeline,
@@ -179,7 +186,7 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
     // correlation table; the answer consumer's `on_answer` hook is a no-op
     // here since `observe` never inserts POLICY entries.
     let dns_query_consumer = DnsQueryCaptureConsumer::spawn(dns_query_ring, crate::dns::query_capture_callback(Arc::clone(&pending)));
-    let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache), Arc::clone(&pending), |_answer| {}));
+    let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache), Arc::clone(&pending), trusted_resolvers, |_answer| {}));
 
     logger.info("cli.observe.watching", "watching for egress events; Ctrl-C to detach and exit");
     while !STOP.load(Ordering::SeqCst) {

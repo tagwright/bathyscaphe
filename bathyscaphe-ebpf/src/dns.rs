@@ -106,15 +106,21 @@
 //! - **DoH/DoT/ECH**: never touch UDP/TCP port 53 at all and are
 //!   structurally invisible to this program by construction -- see
 //!   `docs/DNS.md`.
-//! - **Spoofing**: this program trusts *any* UDP:53-sourced datagram
-//!   reaching the container's ingress path, with no allow-listing of
-//!   trusted resolver addresses (unlike Calico/NSX's "trusted DNS
-//!   servers" restriction, `prior_art_fqdn.md`). A process inside the same
-//!   network namespace capable of spoofing a UDP source port could poison
-//!   the userspace cache this feeds. Chunk #10 (FQDN enforcement) is where
-//!   this stops being purely a display-enrichment concern and starts
-//!   mattering for policy, and is the right point to revisit tightening
-//!   this if warranted -- see `docs/DNS.md`.
+//! - **Spoofing (mitigated as of build chunk #11)**: this program still
+//!   captures *any* UDP:53-sourced datagram reaching the container's
+//!   ingress path -- it has no opinion of its own on trust, matching every
+//!   other kernel-side program in this crate (`bathy_ebpf_design.md`'s
+//!   "policy lives in maps, not in program logic" convention). What
+//!   changed in chunk #11: this program now ALSO captures the packet's own
+//!   SOURCE address ([`bathyscaphe_common::DnsCapture::src_addr`]) so
+//!   userspace can check it against an operator-configured
+//!   trusted-resolver allowlist (`bathyscaphe::dns::trust`) before using
+//!   the answer to seed enforcement -- see `docs/DNS.md`'s trusted-resolver
+//!   section. A source address is not spoofable the way a source PORT
+//!   is by a process sharing the same network namespace as the querying
+//!   container: it is set by whichever real host actually sent the reply,
+//!   the same property IP/CIDR policy itself already relies on everywhere
+//!   else in this codebase.
 
 use aya_ebpf::EbpfContext;
 use aya_ebpf::helpers::{bpf_get_current_cgroup_id, bpf_ktime_get_boot_ns, bpf_skb_load_bytes};
@@ -159,6 +165,18 @@ pub fn try_dns_snoop(ctx: &SkBuffContext) -> Result<(), i64> {
     }
 }
 
+/// Embeds a raw IPv4 source address as IPv4-mapped-into-IPv6 per RFC 4291
+/// -- the same embedding `bathyscaphe-ebpf::convert::dst_addr_v4` uses for
+/// a `bpf_sock_addr` destination, applied here to a byte array read
+/// straight off the packet instead.
+fn embed_v4(addr: [u8; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[10] = 0xff;
+    out[11] = 0xff;
+    out[12..16].copy_from_slice(&addr);
+    out
+}
+
 fn try_dns_snoop_v4(ctx: &SkBuffContext) -> Result<(), i64> {
     let ver_ihl: u8 = ctx.load(0)?;
     let ihl_words = ver_ihl & 0x0F;
@@ -177,7 +195,12 @@ fn try_dns_snoop_v4(ctx: &SkBuffContext) -> Result<(), i64> {
         return Ok(());
     }
 
-    capture_if_dns_response(ctx, ip_header_len)
+    // IPv4 header bytes 12-15 are the SOURCE address, at a fixed offset
+    // regardless of IHL (options, if any, come after byte 20) -- build
+    // chunk #11's trusted-resolver signal (see this module's doc).
+    let src_addr: [u8; 4] = ctx.load(12)?;
+
+    capture_if_dns_response(ctx, ip_header_len, embed_v4(src_addr))
 }
 
 fn try_dns_snoop_v6(ctx: &SkBuffContext) -> Result<(), i64> {
@@ -187,7 +210,10 @@ fn try_dns_snoop_v6(ctx: &SkBuffContext) -> Result<(), i64> {
     if next_header != IPPROTO_UDP {
         return Ok(());
     }
-    capture_if_dns_response(ctx, IPV6_FIXED_HEADER_LEN)
+    // IPv6 fixed header bytes 8-23 are the SOURCE address -- no RFC 4291
+    // embedding needed, a native IPv6 address is already 16 bytes.
+    let src_addr: [u8; 16] = ctx.load(8)?;
+    capture_if_dns_response(ctx, IPV6_FIXED_HEADER_LEN, src_addr)
 }
 
 /// Shared v4/v6 tail: `l4_offset` is where the UDP header starts. Checks
@@ -195,7 +221,7 @@ fn try_dns_snoop_v6(ctx: &SkBuffContext) -> Result<(), i64> {
 ///
 /// ## Never a full `DnsCapture` on the stack
 ///
-/// `DnsCapture` is 536 bytes -- over the eBPF program stack's 512-byte
+/// `DnsCapture` is 552 bytes -- over the eBPF program stack's 512-byte
 /// limit on its own, before counting anything else this function (or its
 /// callers) needs. Reserving first and initializing/filling the record
 /// **in place through a raw pointer into the `RingBuf` slot itself**
@@ -207,7 +233,7 @@ fn try_dns_snoop_v6(ctx: &SkBuffContext) -> Result<(), i64> {
 /// itself suggests, applied to `RingBuf` reserved memory rather than a
 /// per-CPU array (reserved ring buffer memory is exactly as valid a
 /// write destination and needs no extra map).
-fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize) -> Result<(), i64> {
+fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize, src_addr: [u8; 16]) -> Result<(), i64> {
     let src_port_bytes: [u8; 2] = ctx.load(l4_offset)?;
     if u16::from_be_bytes(src_port_bytes) != DNS_SRC_PORT {
         return Ok(());
@@ -251,6 +277,7 @@ fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize) -> Result<(), 
     unsafe {
         DnsCapture::init_at(ptr, cgroup_id, ktime_ns);
         (*ptr).dst_port = dst_port;
+        (*ptr).src_addr = src_addr;
     }
 
     // Tiered fixed-size loads, largest first: each `bpf_skb_load_bytes`

@@ -103,6 +103,17 @@ pub struct RunArgs {
     /// `--fail-closed-on-drops`.
     #[arg(long, value_enum, default_value_t = DropActionArg::Lockdown)]
     pub drop_action: DropActionArg,
+
+    /// An additional trusted DNS resolver address (build chunk #11,
+    /// repeatable), on top of the built-in default set (Docker's embedded
+    /// resolver at 127.0.0.11, plus every `nameserver` line in this host's
+    /// `/etc/resolv.conf`). Only a DNS answer whose SOURCE address is in
+    /// the trusted set can seed FQDN name-rule enforcement -- a container
+    /// using a resolver outside this set gets no name-allow/deny seeded
+    /// from its own DNS traffic (fail-closed in `mode: block`, never a
+    /// silent widening). See `docs/DNS.md`.
+    #[arg(long = "trusted-resolver")]
+    pub trusted_resolver: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -218,6 +229,26 @@ mod tests {
         assert_eq!(args.drop_action, DropActionArg::Lockdown);
         assert_eq!(cli.log_format, LogFormat::Json, "logs default to JSON so bilgeline can route them with no config");
         assert_eq!(cli.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn run_defaults_to_no_extra_trusted_resolvers() {
+        let cli = parse(&["run"]);
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert!(args.trusted_resolver.is_empty());
+    }
+
+    #[test]
+    fn run_parses_repeated_trusted_resolver_flags() {
+        let cli = parse(&["run", "--trusted-resolver", "8.8.8.8", "--trusted-resolver", "1.1.1.1"]);
+        let Command::Run(args) = cli.command else { panic!("expected Run") };
+        assert_eq!(args.trusted_resolver, vec![std::net::IpAddr::from([8, 8, 8, 8]), std::net::IpAddr::from([1, 1, 1, 1])]);
+    }
+
+    #[test]
+    fn run_rejects_a_malformed_trusted_resolver_address() {
+        let result = Cli::try_parse_from(["bathyscaphe", "run", "--trusted-resolver", "not-an-ip"]);
+        assert!(result.is_err(), "an unparseable --trusted-resolver value must be a parse error, not silently ignored");
     }
 
     #[test]

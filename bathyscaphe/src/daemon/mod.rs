@@ -97,7 +97,7 @@ use bathyscaphe_proto::down::DownMessage;
 use bathyscaphe_proto::UpMessage;
 
 use crate::attribution::{Attributor, AttributionService};
-use crate::dns::{DomainCache, NamePatternStore, PendingQueryTable};
+use crate::dns::{DomainCache, NamePatternStore, PendingQueryTable, TrustedResolvers};
 use crate::pipeline::{EventSink, Pipeline};
 use crate::probe::{DnsCaptureConsumer, DnsQueryCaptureConsumer, EventConsumer, Probe};
 
@@ -129,11 +129,28 @@ pub struct DaemonConfig {
     /// `docs/PROTOCOL.md`, and (chunk #12) the README, per Nate's explicit
     /// ask that it stay evident, not just discoverable by reading source.
     pub r2: DropEscalationConfig,
+    /// Build chunk #11: the operator-configured trusted-resolver set. Only
+    /// a DNS answer whose own captured source address is in this set can
+    /// seed FQDN name-rule enforcement (`daemon::fqdn::on_dns_answer`) --
+    /// see `crate::dns::trust`'s module doc for the default set and the
+    /// fail-closed direction an untrusted answer falls back to.
+    /// `cli::run_cmd::build_config` is where a real CLI invocation
+    /// constructs this (default set plus `--trusted-resolver`); this
+    /// field's own [`Default`] reads the real host's `/etc/resolv.conf`
+    /// for the same standalone-programmatic-use convenience every other
+    /// field here offers.
+    pub trusted_resolvers: TrustedResolvers,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self { bpffs_root: PathBuf::from(crate::probe::DEFAULT_BPFFS_ROOT), cgroup_root: PathBuf::from(crate::attribution::cgroup::DEFAULT_CGROUP_ROOT), backend_version: env!("CARGO_PKG_VERSION").to_string(), r2: DropEscalationConfig::default() }
+        Self {
+            bpffs_root: PathBuf::from(crate::probe::DEFAULT_BPFFS_ROOT),
+            cgroup_root: PathBuf::from(crate::attribution::cgroup::DEFAULT_CGROUP_ROOT),
+            backend_version: env!("CARGO_PKG_VERSION").to_string(),
+            r2: DropEscalationConfig::default(),
+            trusted_resolvers: TrustedResolvers::default_at(std::path::Path::new("/etc/resolv.conf")),
+        }
     }
 }
 
@@ -232,13 +249,21 @@ impl Daemon {
         // `fqdn::NameUnresolvedBlockWatcher`).
         let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
         let name_rules = Arc::new(Mutex::new(NamePatternStore::new()));
+        // Build chunk #11: the operator-configured trusted-resolver
+        // allowlist, shared between the DNS answer consumer (which checks
+        // every captured response's own source address against it) and
+        // nothing else -- see `crate::dns::trust`'s module doc.
+        let trusted_resolvers = Arc::new(config.trusted_resolvers);
 
         let (counting_sink, events_emitted, denies_since_last) = stats::CountingSink::new(tx.clone());
         let name_watch_sink = NameUnresolvedBlockWatcher::new(counting_sink, Arc::clone(&shared_state), Arc::clone(&name_rules), Arc::clone(&security));
         let pipeline = Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), name_watch_sink).context("failed to construct the event pipeline")?;
         let consumer = EventConsumer::spawn(ring, pipeline.into_callback());
         let dns_query_consumer = DnsQueryCaptureConsumer::spawn(dns_query_ring, crate::dns::query_capture_callback(Arc::clone(&pending)));
-        let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, dns_answer_callback(Arc::clone(&domain_cache), Arc::clone(&pending), Arc::clone(&shared_probe), Arc::clone(&name_rules)));
+        let dns_consumer = DnsCaptureConsumer::spawn(
+            dns_ring,
+            dns_answer_callback(Arc::clone(&domain_cache), Arc::clone(&pending), Arc::clone(&shared_probe), Arc::clone(&name_rules), Arc::clone(&trusted_resolvers), Arc::clone(&resolver), Arc::clone(&security), tx.clone()),
+        );
 
         let stats_shutdown = Arc::new(AtomicBool::new(false));
         let stats_handle = spawn_stats_thread(Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&security), tx.clone(), Arc::clone(&stats_shutdown), events_emitted, denies_since_last, config.r2, stats_interval_s);
@@ -261,15 +286,29 @@ impl Daemon {
 }
 
 /// Builds the `DNS_EVENTS` (answer) ring-buffer callback for [`Daemon::run`]:
-/// `crate::dns::capture_callback`'s cache-recording + correlation, plus a
+/// `crate::dns::capture_callback`'s cache-recording + correlation +
+/// trusted-resolver check (build chunk #11), plus a
 /// `daemon::fqdn::on_dns_answer` hook that locks `shared_probe` only for
 /// the (rare, DNS-cadence, not connect-cadence) duration of one potential
 /// `POLICY` insert -- kept as its own named function rather than an inline
-/// closure purely so this file's `run` body stays readable.
-fn dns_answer_callback(domain_cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<PendingQueryTable>>, shared_probe: Arc<Mutex<Probe>>, name_rules: Arc<Mutex<NamePatternStore>>) -> crate::probe::DnsCallback {
-    crate::dns::capture_callback(domain_cache, pending, move |answer| {
+/// closure purely so this file's `run` body stays readable. `sink` (a
+/// clone of the same `mpsc::Sender<UpMessage>` every other producer
+/// writes through) is where `on_dns_answer`'s `dns.untrusted_answer` loud
+/// record goes on the rare occasion one fires.
+#[allow(clippy::too_many_arguments)]
+fn dns_answer_callback(
+    domain_cache: Arc<Mutex<DomainCache>>,
+    pending: Arc<Mutex<PendingQueryTable>>,
+    shared_probe: Arc<Mutex<Probe>>,
+    name_rules: Arc<Mutex<NamePatternStore>>,
+    trusted_resolvers: Arc<TrustedResolvers>,
+    resolver: Arc<crate::attribution::Resolver>,
+    security: Arc<SecurityEmitter>,
+    mut sink: mpsc::Sender<UpMessage>,
+) -> crate::probe::DnsCallback {
+    crate::dns::capture_callback(domain_cache, pending, trusted_resolvers, move |answer| {
         let mut probe = shared_probe.lock().unwrap_or_else(|poison| poison.into_inner());
-        fqdn::on_dns_answer(&mut *probe as &mut dyn ProbeApi, &name_rules, &answer);
+        fqdn::on_dns_answer(&mut *probe as &mut dyn ProbeApi, &name_rules, resolver.as_ref(), &security, &mut sink, &answer);
     })
 }
 

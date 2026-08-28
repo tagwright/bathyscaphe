@@ -45,10 +45,12 @@ pub const DNS_CAPTURE_MAX: usize = 512;
 /// zero-implicit-padding convention as every other kernel/user boundary
 /// type in this crate (see [`crate::policy::PolicyValue`]'s doc): the two
 /// `u64`s reach 8-byte alignment with no compiler-inserted gap, `len`/
-/// `dst_port` (two `u16`s) need no gap after them, and `_pad` rounds up to
-/// a multiple of 8 before `payload` (whose own alignment is 1, so it needs
-/// no padding of its own) so every byte that crosses the kernel/user
-/// boundary as `aya::Pod` is deterministically initialized.
+/// `dst_port` (two `u16`s) need no gap after them, [`Self::src_addr`]
+/// (alignment 1, 16 bytes) follows with no gap of its own, `_pad` rounds
+/// the running total up to a multiple of 8 before `payload` (whose own
+/// alignment is 1, so it needs no padding of its own) so every byte that
+/// crosses the kernel/user boundary as `aya::Pod` is deterministically
+/// initialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct DnsCapture {
@@ -86,6 +88,19 @@ pub struct DnsCapture {
     /// wrong (the Docker-embedded-DNS / Tailscale-intercepted-DNS case
     /// `docs/DNS.md` documents).
     pub dst_port: u16,
+    /// Build chunk #11: the IP packet's own SOURCE address that carried
+    /// this response, IPv4-mapped-into-IPv6 per RFC 4291 -- the same
+    /// embedding [`crate::event::Event::src_addr`] and
+    /// [`crate::policy::PolicyKeyData::addr`] use. This is the field the
+    /// trusted-resolver allowlist (`bathyscaphe::dns::trust`) checks: only
+    /// a response whose `src_addr` is in the operator-configured
+    /// trusted-resolver set is used to seed enforcement (`docs/DNS.md`'s
+    /// spoofing section). Unlike [`Self::cgroup_id`], this value is never
+    /// wrong for an injected/synthesized reply -- the packet's own source
+    /// address is set by whatever process actually sent it (the resolver),
+    /// regardless of which cgroup's task context happened to be running
+    /// when the kernel hook fired.
+    pub src_addr: [u8; 16],
     _pad: [u8; 4],
     /// The raw, unparsed UDP payload bytes (a DNS message, if the source
     /// port really was 53 and the sender is honest -- see `docs/DNS.md`
@@ -108,13 +123,13 @@ impl DnsCapture {
     /// code -- tests, and `probe::dns`'s ring-buffer decode, which already
     /// has the full record as a byte slice off the ring and reads it back
     /// as one owned value. **Never call this from `bathyscaphe-ebpf`**:
-    /// constructing a whole `Self` (536 bytes) as a local blows the eBPF
+    /// constructing a whole `Self` (552 bytes) as a local blows the eBPF
     /// program stack's 512-byte limit. The kernel-side constructor is
     /// [`Self::init_at`], which writes directly through a pointer into
     /// already-allocated destination memory (a `RingBuf` reserved slot)
     /// instead of ever materializing a full `Self` on the stack.
     pub const fn zeroed_for(cgroup_id: u64, ktime_ns: u64) -> Self {
-        Self { ktime_ns, cgroup_id, len: 0, dst_port: 0, _pad: [0; 4], payload: [0u8; DNS_CAPTURE_MAX] }
+        Self { ktime_ns, cgroup_id, len: 0, dst_port: 0, src_addr: [0u8; 16], _pad: [0; 4], payload: [0u8; DNS_CAPTURE_MAX] }
     }
 
     /// Initializes a `DnsCapture` **in place** at `ptr`: every field is
@@ -145,6 +160,7 @@ impl DnsCapture {
             core::ptr::addr_of_mut!((*ptr).cgroup_id).write(cgroup_id);
             core::ptr::addr_of_mut!((*ptr).len).write(0);
             core::ptr::addr_of_mut!((*ptr).dst_port).write(0);
+            core::ptr::addr_of_mut!((*ptr).src_addr).write([0u8; 16]);
             core::ptr::addr_of_mut!((*ptr)._pad).write([0u8; 4]);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*ptr).payload).cast::<u8>(), 0, DNS_CAPTURE_MAX);
         }
@@ -244,16 +260,16 @@ unsafe impl aya::Pod for DnsQueryCapture {}
 mod tests {
     use super::*;
 
-    const _DNS_CAPTURE_SIZE: () = assert!(core::mem::size_of::<DnsCapture>() == 24 + DNS_CAPTURE_MAX);
+    const _DNS_CAPTURE_SIZE: () = assert!(core::mem::size_of::<DnsCapture>() == 40 + DNS_CAPTURE_MAX);
     const _DNS_CAPTURE_ALIGN: () = assert!(core::mem::align_of::<DnsCapture>() == 8);
     const _DNS_QUERY_CAPTURE_SIZE: () = assert!(core::mem::size_of::<DnsQueryCapture>() == 24);
     const _DNS_QUERY_CAPTURE_ALIGN: () = assert!(core::mem::align_of::<DnsQueryCapture>() == 8);
 
     #[test]
     fn dns_capture_is_pinned() {
-        assert_eq!(core::mem::size_of::<DnsCapture>(), 24 + DNS_CAPTURE_MAX);
+        assert_eq!(core::mem::size_of::<DnsCapture>(), 40 + DNS_CAPTURE_MAX);
         assert_eq!(core::mem::align_of::<DnsCapture>(), 8);
-        assert_eq!(DnsCapture::WIRE_SIZE, 24 + DNS_CAPTURE_MAX);
+        assert_eq!(DnsCapture::WIRE_SIZE, 40 + DNS_CAPTURE_MAX);
     }
 
     #[test]
@@ -261,6 +277,19 @@ mod tests {
         let mut capture = DnsCapture::zeroed_for(1, 1);
         capture.dst_port = 54321;
         assert_eq!(capture.dst_port, 54321);
+    }
+
+    #[test]
+    fn dns_capture_carries_src_addr() {
+        let mut capture = DnsCapture::zeroed_for(1, 1);
+        capture.src_addr = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 11];
+        assert_eq!(capture.src_addr[12..16], [127, 0, 0, 11]);
+    }
+
+    #[test]
+    fn zeroed_for_starts_with_a_zeroed_src_addr() {
+        let capture = DnsCapture::zeroed_for(1, 1);
+        assert_eq!(capture.src_addr, [0u8; 16]);
     }
 
     #[test]
