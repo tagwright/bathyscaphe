@@ -30,8 +30,8 @@ use crate::pipeline::EventSink;
 
 use super::probe_api::ProbeApi;
 use super::security::{SecurityEmitter, dns_untrusted_answer_record, name_unresolved_block_record};
-use super::stats::now_rfc3339;
 use super::state::DaemonState;
+use super::stats::now_rfc3339;
 
 /// The `POLICY` host route this build inserts is always a full `/128`
 /// (`prefix_bits_over_addr = 128` per `probe::policy::build_policy_key`'s
@@ -79,9 +79,7 @@ fn insert_host_route(probe: &mut dyn ProbeApi, answer: &AttributedAnswer, patter
             let port_hi = port.unwrap_or(u16::MAX);
             let proto_raw = proto.map(|p| PortRule::encode_proto(p as u8)).unwrap_or(PortRule::PROTO_ANY);
             let default_raw = if pattern.action == RuleAction::Allow { RuleAction::Deny as u8 } else { RuleAction::Allow as u8 };
-            PolicyValue::new(default_raw, RuleSource::Dns as u8, expires_at_ns)
-                .with_port_rule(PortRule::new(port_lo, port_hi, proto_raw, action_raw))
-                .unwrap_or_else(|value| value) // MAX_PORT_RULES is 8; one rule never overflows a fresh value.
+            PolicyValue::new(default_raw, RuleSource::Dns as u8, expires_at_ns).with_port_rule(PortRule::new(port_lo, port_hi, proto_raw, action_raw)).unwrap_or_else(|value| value) // MAX_PORT_RULES is 8; one rule never overflows a fresh value.
         }
     };
 
@@ -457,14 +455,25 @@ mod tests {
             dst: Endpoint { addr: IpAddr::from([203, 0, 113, 9]), port: 443 },
             verdict,
             rule_id: None,
-            domain: domain_name.map(|name| Domain { name: Some(name.to_string()), source: Some(bathyscaphe_proto::DomainSource::Dns), confidence: Some(bathyscaphe_proto::DomainConfidence::Asserted) }).unwrap_or_default(),
+            domain: domain_name
+                .map(|name| Domain { name: Some(name.to_string()), source: Some(bathyscaphe_proto::DomainSource::Dns), confidence: Some(bathyscaphe_proto::DomainConfidence::Asserted) })
+                .unwrap_or_default(),
             meta: EventMeta { dropped_since_last: 0 },
         }
     }
 
     fn state_with_container(container_id: &str, cgroup_id: u64) -> Arc<Mutex<DaemonState>> {
         let mut state = DaemonState::new();
-        state.upsert(ContainerState { container_id: container_id.to_string(), cgroup_id, mode: Mode::Block, generation: 1, default: DefaultVerdict::Deny, rules_active: 1, rules_inert: 0, orphaned: false });
+        state.upsert(ContainerState {
+            container_id: container_id.to_string(),
+            cgroup_id,
+            mode: Mode::Block,
+            generation: 1,
+            default: DefaultVerdict::Deny,
+            rules_active: 1,
+            rules_inert: 0,
+            orphaned: false,
+        });
         Arc::new(Mutex::new(state))
     }
 

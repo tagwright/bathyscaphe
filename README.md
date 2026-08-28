@@ -2,11 +2,13 @@
 
 Status: under construction, past scaffold. The workspace builds, the
 eBPF programs load and pin, policy compilation and reconciliation work,
-and the CLI (`run` / `unpin --all` / `observe` / `version`) is wired up.
-Not yet built: the DNS-snoop FQDN layer and the packaged Dockerfile. See
-docs/BUILDING.md for the toolchain that makes the eBPF side compile at
-all, since that's the part most likely to need touching before anything
-else here is useful.
+the CLI (`run` / `unpin --all` / `observe` / `version`) is wired up, and
+the DNS-snoop FQDN layer is built through. Packaged: a multi-stage
+Dockerfile, published to `ghcr.io/tagwright/bathyscaphe` on release, see
+docs/DEPLOY.md for the required runtime privilege/mounts and the airlock
+integration topology. See docs/BUILDING.md for the toolchain that makes
+the eBPF side compile at all, since that's the part most likely to need
+touching before anything else here is useful.
 
 A bathyscaphe is a crewed deep-sea submersible: a small pressure-hulled
 vehicle that descends into the deep ocean under its own ballast, with

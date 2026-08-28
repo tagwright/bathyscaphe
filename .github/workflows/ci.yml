@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# bathyscaphe has no tagwright module dependencies (crates.io + in-workspace
+# crates only), so there is none of ballast/airlock's GOPRIVATE-shaped
+# module-fetch trap here -- just the two-toolchain build docs/BUILDING.md
+# proves: stable for the userspace crates, nightly + bpf-linker for the
+# no_std bathyscaphe-ebpf crate, driven transparently by bathyscaphe's own
+# build.rs (aya-build). This workflow reproduces that proof on every push
+# and PR against main.
+#
+# The privileged #[ignore]d live-kernel tests (load/attach/pin against a
+# real cgroup v2 host, the full observe/enforce/fail-safe integration
+# harness in test/) do NOT run here -- a GitHub-hosted runner has no BPF
+# privilege and no real container cgroups to attach to. `cargo test` already
+# excludes #[ignore]d tests by default, so no extra flag is needed to skip
+# them; see docs/TESTING.md for how they get run instead (a privileged
+# throwaway Docker container, by hand or as part of a later chunk's own
+# harness, never CI).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  BPF_LINKER_VERSION: "0.11.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src
+        run: rustup toolchain install nightly --component rust-src
+
+      - name: Install rustfmt + clippy on the default (stable) toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Install bpf-linker (prebuilt musl release, not `cargo install`)
+        # docs/BUILDING.md is explicit about why: building bpf-linker 0.11.0
+        # from source needs a matching system LLVM (LLVM 23) and isn't the
+        # supported path for regular use. The prebuilt release tarball
+        # sidesteps that. zstd isn't preinstalled on ubuntu-latest.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          curl -sL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          tar --zstd -C /tmp -xf /tmp/bpf-linker.tar.zst
+          sudo install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
+
+      - name: Build
+        # One `cargo build` at the workspace root builds the stable
+        # default-members AND, as a side effect of bathyscaphe/build.rs,
+        # cross-compiles bathyscaphe-ebpf on nightly via bpf-linker and
+        # embeds the result. No separate ebpf build step -- see
+        # docs/BUILDING.md.
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Format check
+        # rustfmt.toml pins this workspace's established wide-line style
+        # (long method chains and struct literals on one line) so this
+        # agrees with what the codebase already looks like, rather than
+        # rustfmt's stock 100-column default fighting it on every PR.
+        run: cargo fmt --check
+
+      - name: Clippy (non-blocking)
+        # Not gated on a clean run yet: the workspace currently carries a
+        # handful of pre-existing warnings (a couple of collapsible-if and
+        # field-reassign-with-default idioms, and some intentionally-kept
+        # not-yet-wired helpers flagged dead_code -- e.g. udp_port_rule,
+        # PolicyStore::tracked_container_count). None are correctness bugs.
+        # This step still runs and prints them on every build so they stay
+        # visible; flip to a blocking `-- -D warnings` once they're cleaned
+        # up (fair game for a later chunk, not this one).
+        run: cargo clippy --all-targets
+        continue-on-error: true

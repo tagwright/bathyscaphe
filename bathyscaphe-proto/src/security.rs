@@ -162,26 +162,12 @@ impl SecurityRecord {
     /// `container.*`, with optional `rule_id` and `domain` attributes
     /// included only when given. `severity` fills both `severity_text`
     /// and `severity_number` consistently.
-    pub fn new(
-        timestamp: impl Into<String>,
-        severity: Severity,
-        body: impl Into<String>,
-        reason: &str,
-        container: SecurityContainer<'_>,
-        rule_id: Option<&str>,
-        domain: Option<&str>,
-    ) -> Self {
+    pub fn new(timestamp: impl Into<String>, severity: Severity, body: impl Into<String>, reason: &str, container: SecurityContainer<'_>, rule_id: Option<&str>, domain: Option<&str>) -> Self {
         let mut attributes = BTreeMap::new();
         attributes.insert("reason".to_string(), Value::String(reason.to_string()));
         attributes.insert("container.id".to_string(), Value::String(container.id.to_string()));
-        attributes.insert(
-            "container.name".to_string(),
-            container.name.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
-        );
-        attributes.insert(
-            "container.image".to_string(),
-            container.image.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
-        );
+        attributes.insert("container.name".to_string(), container.name.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null));
+        attributes.insert("container.image".to_string(), container.image.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null));
         if let Some(rule_id) = rule_id {
             attributes.insert("rule_id".to_string(), Value::String(rule_id.to_string()));
         }
@@ -189,12 +175,6 @@ impl SecurityRecord {
             attributes.insert("domain".to_string(), Value::String(domain.to_string()));
         }
 
-        Self {
-            timestamp: timestamp.into(),
-            severity_text: severity.text().to_string(),
-            severity_number: severity.number(),
-            body: body.into(),
-            attributes,
-        }
+        Self { timestamp: timestamp.into(), severity_text: severity.text().to_string(), severity_number: severity.number(), body: body.into(), attributes }
     }
 }

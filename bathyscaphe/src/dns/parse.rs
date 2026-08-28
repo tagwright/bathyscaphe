@@ -340,7 +340,8 @@ mod tests {
         });
         assert!(bytes.len() > 64 && bytes.len() < 128, "fixture must land in the old 64/128-byte tier gap, got {} bytes", bytes.len());
 
-        let parsed = parse_dns_response(&bytes).expect("a full, untruncated capture at this size must parse completely -- pre-chunk-#12 tier truncation would have lost the tail of even this single answer");
+        let parsed =
+            parse_dns_response(&bytes).expect("a full, untruncated capture at this size must parse completely -- pre-chunk-#12 tier truncation would have lost the tail of even this single answer");
         assert_eq!(parsed.name, "tier-gap.example.com");
         assert_eq!(parsed.answers, vec![(IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)), 300)]);
     }

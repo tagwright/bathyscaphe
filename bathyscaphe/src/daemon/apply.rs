@@ -107,10 +107,7 @@ fn apply_make_before_break(probe: &mut dyn ProbeApi, cgroup_id: u64, compiled: &
 /// -- a trivial field-for-field carry, kept as its own function so
 /// [`apply_policy`]'s main body reads as one straight-line sequence.
 fn to_dns_patterns(compiled: &[compile::CompiledNamePattern]) -> Vec<NamePattern> {
-    compiled
-        .iter()
-        .map(|p| NamePattern { rule_id: p.rule_id.clone(), pattern: p.pattern.clone(), action: p.action, port: p.port, proto: p.proto })
-        .collect()
+    compiled.iter().map(|p| NamePattern { rule_id: p.rule_id.clone(), pattern: p.pattern.clone(), action: p.action, port: p.port, proto: p.proto }).collect()
 }
 
 /// Applies one `policy` directive end to end: compile, resolve/attach,
@@ -134,7 +131,13 @@ pub fn apply_policy(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &
     apply_make_before_break(probe, cgroup_id, &compiled);
 
     if let Err(error) = probe.set_enforcement(cgroup_id, compiled.mode, compiled.default, compiled.generation) {
-        return PolicyAck { container_id: policy.container_id.clone(), generation: policy.generation, status: PolicyAckStatus::Error, inert_rules: compiled.inert_rules, error: Some(format!("ENFORCEMENT write failed: {error}")) };
+        return PolicyAck {
+            container_id: policy.container_id.clone(),
+            generation: policy.generation,
+            status: PolicyAckStatus::Error,
+            inert_rules: compiled.inert_rules,
+            error: Some(format!("ENFORCEMENT write failed: {error}")),
+        };
     }
 
     // Build chunk #10: register this snapshot's name-rule patterns,
@@ -172,7 +175,14 @@ pub fn apply_policy(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &
 /// a released container's still-live pending query is exactly the STALE
 /// entry chunk #13's live repro found a later, unrelated container's query
 /// colliding with.
-pub fn apply_release(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &dyn ContainerLookup, name_rules: &Mutex<NamePatternStore>, pending: &Mutex<PendingQueryTable>, container_id: &str) -> ReleaseAck {
+pub fn apply_release(
+    probe: &mut dyn ProbeApi,
+    state: &mut DaemonState,
+    lookup: &dyn ContainerLookup,
+    name_rules: &Mutex<NamePatternStore>,
+    pending: &Mutex<PendingQueryTable>,
+    container_id: &str,
+) -> ReleaseAck {
     let cgroup_id = lookup.cgroup_id_for_container(container_id).or_else(|| state.containers.get(container_id).map(|c| c.cgroup_id));
     if let Some(cgroup_id) = cgroup_id {
         let _ = probe.clear_enforcement(cgroup_id);
@@ -287,7 +297,13 @@ mod tests {
 
         let mut rules = Vec::new();
         for port in 0..=8u16 {
-            rules.push(Rule { id: format!("r{port}"), action: WireAction::Allow, r#match: Match::Cidr { cidr: "10.0.0.0/24".to_string(), port: Some(1000 + port), proto: None, unknown: Default::default() }, expires_at: None, source: WireSource::Static });
+            rules.push(Rule {
+                id: format!("r{port}"),
+                action: WireAction::Allow,
+                r#match: Match::Cidr { cidr: "10.0.0.0/24".to_string(), port: Some(1000 + port), proto: None, unknown: Default::default() },
+                expires_at: None,
+                source: WireSource::Static,
+            });
         }
         let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules };
 
@@ -318,7 +334,13 @@ mod tests {
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
 
-        let name_rule = Rule { id: "r-name".to_string(), action: WireAction::Allow, r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown: Default::default() }, expires_at: None, source: WireSource::Static };
+        let name_rule = Rule {
+            id: "r-name".to_string(),
+            action: WireAction::Allow,
+            r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown: Default::default() },
+            expires_at: None,
+            source: WireSource::Static,
+        };
         let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![name_rule] };
 
         let ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
@@ -335,7 +357,13 @@ mod tests {
         let mut state = DaemonState::new();
         let name_rules = empty_name_rules();
 
-        let first_rule = Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Name { pattern: "old.example.com".to_string(), port: None, proto: None, unknown: Default::default() }, expires_at: None, source: WireSource::Static };
+        let first_rule = Rule {
+            id: "r1".to_string(),
+            action: WireAction::Allow,
+            r#match: Match::Name { pattern: "old.example.com".to_string(), port: None, proto: None, unknown: Default::default() },
+            expires_at: None,
+            source: WireSource::Static,
+        };
         let first = Policy { container_id: container_id(), generation: 1, mode: WireMode::Alert, default: WireDefault::Allow, rules: vec![first_rule] };
         apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &first);
         assert!(name_rules.lock().unwrap().first_matching_allow(9, "old.example.com").is_some());
@@ -383,7 +411,11 @@ mod tests {
 
         let second = Policy { container_id: container_id(), generation: 2, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("192.168.0.0/16", WireAction::Allow)] };
         let second_ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &second);
-        assert_eq!(second_ack.status, PolicyAckStatus::Applied, "sanity: the second push must actually apply (a regression here would silently leave the diff below unexercised, exactly the original bug)");
+        assert_eq!(
+            second_ack.status,
+            PolicyAckStatus::Applied,
+            "sanity: the second push must actually apply (a regression here would silently leave the diff below unexercised, exactly the original bug)"
+        );
 
         let final_keys = probe.tracked_policy_keys(11);
         assert_eq!(final_keys.len(), 2, "the old /24 entry must be gone, replaced by the new /16 plus baseline");
@@ -472,7 +504,13 @@ mod tests {
         let name_rules = empty_name_rules();
         let pending = empty_pending();
 
-        let name_rule = Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown: Default::default() }, expires_at: None, source: WireSource::Static };
+        let name_rule = Rule {
+            id: "r1".to_string(),
+            action: WireAction::Allow,
+            r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown: Default::default() },
+            expires_at: None,
+            source: WireSource::Static,
+        };
         let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Alert, default: WireDefault::Allow, rules: vec![name_rule] };
         apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
         assert!(name_rules.lock().unwrap().has_active_allow_pattern(22));

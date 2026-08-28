@@ -26,14 +26,10 @@ pub mod down;
 pub mod security;
 pub mod up;
 
-pub use codec::{decode_line, encode_line, CodecError, MAX_CONSECUTIVE_MALFORMED_LINES, MAX_LINE_BYTES};
+pub use codec::{CodecError, MAX_CONSECUTIVE_MALFORMED_LINES, MAX_LINE_BYTES, decode_line, encode_line};
 pub use common::{
-    Capability, Container, DefaultVerdict, Domain, DomainConfidence, DomainSource, Endpoint, EventKind, Mode, Process,
-    Runtime, RuleAction, RuleSource, TransportProto, Verdict, PROTO_VERSION,
+    Capability, Container, DefaultVerdict, Domain, DomainConfidence, DomainSource, Endpoint, EventKind, Mode, PROTO_VERSION, Process, RuleAction, RuleSource, Runtime, TransportProto, Verdict,
 };
 pub use down::{DownMessage, Match, Policy, Release, ReleaseAll, Rule, Shutdown, Start, SyncComplete};
-pub use security::{Severity, SecurityContainer, SecurityRecord};
-pub use up::{
-    AttributeMap, ContainerStats, ErrorMsg, Event, EventMeta, Hello, PinnedContainer, PolicyAck, PolicyAckStatus,
-    ReleaseAck, ReleaseStatus, Stats, UpMessage,
-};
+pub use security::{SecurityContainer, SecurityRecord, Severity};
+pub use up::{AttributeMap, ContainerStats, ErrorMsg, Event, EventMeta, Hello, PinnedContainer, PolicyAck, PolicyAckStatus, ReleaseAck, ReleaseStatus, Stats, UpMessage};

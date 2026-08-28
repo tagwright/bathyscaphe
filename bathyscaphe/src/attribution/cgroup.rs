@@ -362,7 +362,13 @@ fn add_watch(inotify: &mut Inotify, path: &Path, path_to_wd: &mut HashMap<PathBu
 /// where an unconditional blocking read would hang forever.
 const POLL_TIMEOUT_MS: i32 = 250;
 
-fn watch_loop(mut inotify: Inotify, map: Arc<CgroupMap>, mut path_to_wd: HashMap<PathBuf, WatchDescriptor>, mut wd_to_path: HashMap<WatchDescriptor, PathBuf>, shutdown: Arc<std::sync::atomic::AtomicBool>) {
+fn watch_loop(
+    mut inotify: Inotify,
+    map: Arc<CgroupMap>,
+    mut path_to_wd: HashMap<PathBuf, WatchDescriptor>,
+    mut wd_to_path: HashMap<WatchDescriptor, PathBuf>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
     use std::os::fd::AsRawFd;
 
     let mut buffer = [0u8; INOTIFY_BUFFER_LEN];
@@ -415,7 +421,10 @@ fn watch_loop(mut inotify: Inotify, map: Arc<CgroupMap>, mut path_to_wd: HashMap
                 // A directory can arrive with pre-existing children (e.g.
                 // `MOVED_TO` relocating a populated subtree); walk it so
                 // nothing nested is missed.
-                if let Ok(mut nested) = { let mut v = Vec::new(); walk_dirs(&path, &mut v).map(|()| v) } {
+                if let Ok(mut nested) = {
+                    let mut v = Vec::new();
+                    walk_dirs(&path, &mut v).map(|()| v)
+                } {
                     for child in nested.drain(..) {
                         map.observe_dir(&child);
                         add_watch(&mut inotify, &child, &mut path_to_wd, &mut wd_to_path);

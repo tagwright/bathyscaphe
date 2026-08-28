@@ -34,9 +34,7 @@ pub fn check() -> Result<()> {
 }
 
 fn check_kernel_version() -> Result<()> {
-    let current = KernelVersion::current()
-        .map_err(|error| anyhow::anyhow!("{error}"))
-        .context("failed to determine the running kernel version")?;
+    let current = KernelVersion::current().map_err(|error| anyhow::anyhow!("{error}")).context("failed to determine the running kernel version")?;
     let floor = KernelVersion::new(KERNEL_FLOOR_MAJOR, KERNEL_FLOOR_MINOR, KERNEL_FLOOR_PATCH);
     if current < floor {
         bail!(
@@ -57,8 +55,7 @@ fn check_cgroup_v2_unified() -> Result<()> {
     // for at least that long.
     let rc = unsafe { libc::statfs(path.as_ptr(), &mut stat) };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("statfs({CGROUP_MOUNT}) failed; cannot verify a cgroup v2 unified hierarchy is mounted"));
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("statfs({CGROUP_MOUNT}) failed; cannot verify a cgroup v2 unified hierarchy is mounted"));
     }
     // `f_type`'s concrete integer type varies by libc/arch (i32/i64/u32/u64
     // across platforms); `as i64` is deliberately used instead of `From`, so

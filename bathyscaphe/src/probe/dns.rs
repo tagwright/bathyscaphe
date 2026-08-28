@@ -247,7 +247,8 @@ mod live_smoke {
         let bpffs_root = PathBuf::from(BPFFS_ROOT);
         let _ = Probe::unpin_all_at(&bpffs_root);
 
-        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone()).expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection surfaces here, for EVERY program including dns_snoop");
+        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone())
+            .expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection surfaces here, for EVERY program including dns_snoop");
 
         let container_id = match create_and_start_test_container() {
             Ok(id) => id,
@@ -435,7 +436,8 @@ mod live_smoke {
         let bpffs_root = PathBuf::from(BPFFS_ROOT_SRC_ADDR);
         let _ = Probe::unpin_all_at(&bpffs_root);
 
-        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone()).expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection of dns_snoop's new source-address reads would surface here");
+        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone())
+            .expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection of dns_snoop's new source-address reads would surface here");
 
         // Unlike the sibling test above (a single `nslookup`, 1s in), this
         // repeats the lookup every second for 10s: attaching a fresh probe
@@ -445,7 +447,9 @@ mod live_smoke {
         // where `attach_container` hasn't run yet by the time it fires --
         // repeating gives the attach step a comfortable window to land
         // before at least one of several identical queries.
-        let create_body = format!(r#"{{"Image":"alpine:latest","Cmd":["sh","-c","for i in 1 2 3 4 5 6 7 8 9 10; do nslookup example.com; sleep 1; done"],"Tty":false,"HostConfig":{{"NetworkMode":"{TEST_NETWORK_NAME}"}}}}"#);
+        let create_body = format!(
+            r#"{{"Image":"alpine:latest","Cmd":["sh","-c","for i in 1 2 3 4 5 6 7 8 9 10; do nslookup example.com; sleep 1; done"],"Tty":false,"HostConfig":{{"NetworkMode":"{TEST_NETWORK_NAME}"}}}}"#
+        );
         let container_id: Result<String, String> = (|| {
             let (status, body) = docker_api("POST", &format!("/{API_VERSION}/containers/create?name={TEST_CONTAINER_NAME_SRC_ADDR}"), &create_body).map_err(|e| e.to_string())?;
             if status != 201 {
@@ -511,7 +515,8 @@ mod live_smoke {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err("dns_snoop captured no DNS response at all within the deadline -- this DOES indicate a capture-logic problem with the new source-address reads, not just a resolver-delivery nuance".to_string())
+            Err("dns_snoop captured no DNS response at all within the deadline -- this DOES indicate a capture-logic problem with the new source-address reads, not just a resolver-delivery nuance"
+                .to_string())
         })();
 
         remove_test_container(&container_id);
@@ -521,12 +526,17 @@ mod live_smoke {
         let src_addr_bytes = outcome.expect("attach_container must succeed (verifier acceptance of the new source-address reads) and dns_snoop must capture a real, parseable DNS response");
         let v6 = Ipv6Addr::from(src_addr_bytes);
         let captured_addr = v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6));
-        assert!(!captured_addr.is_unspecified(), "src_addr must be a real captured address, not the field's zero-initialized default -- a zero here would mean the new ctx.load(12)/ctx.load(8) reads never actually ran");
+        assert!(
+            !captured_addr.is_unspecified(),
+            "src_addr must be a real captured address, not the field's zero-initialized default -- a zero here would mean the new ctx.load(12)/ctx.load(8) reads never actually ran"
+        );
 
         let docker_default_only = TrustedResolvers::default_set_from("");
         if captured_addr == DOCKER_EMBEDDED_DNS {
             assert!(docker_default_only.is_trusted(captured_addr), "127.0.0.11 must always be in the default trusted set");
-            eprintln!("dns live_smoke (src_addr): full proof -- captured src_addr {captured_addr} is Docker's embedded resolver, and the default trusted-resolver set trusts it, exactly as docs/DNS.md describes");
+            eprintln!(
+                "dns live_smoke (src_addr): full proof -- captured src_addr {captured_addr} is Docker's embedded resolver, and the default trusted-resolver set trusts it, exactly as docs/DNS.md describes"
+            );
         } else {
             eprintln!(
                 "dns live_smoke (src_addr): PARTIAL proof -- verifier accepted the new source-address reads and dns_snoop captured a real DNS response's src_addr ({captured_addr}), proving the kernel-side capture itself works; on THIS host the responding resolver's address differs from the expected 127.0.0.11 (matching the sibling test's own documented resolver-delivery nuance for this host), so the default-trusts-it assertion is reported rather than enforced here -- would need a --trusted-resolver flag naming this host's actual resolver to see it seed enforcement, exactly as docs/DNS.md's fail-closed section describes."
@@ -587,7 +597,12 @@ mod live_smoke {
             packet.set_flags(simple_dns::PacketFlag::RESPONSE);
             packet.questions.push(simple_dns::Question::new(simple_dns::Name::new_unchecked(name).into_owned(), simple_dns::TYPE::A.into(), simple_dns::CLASS::IN.into(), false));
             for i in 1..=n {
-                packet.answers.push(simple_dns::ResourceRecord::new(simple_dns::Name::new_unchecked(name), simple_dns::CLASS::IN, 60, simple_dns::rdata::RData::A(simple_dns::rdata::A { address: Ipv4Addr::new(10, 0, 0, i).into() })));
+                packet.answers.push(simple_dns::ResourceRecord::new(
+                    simple_dns::Name::new_unchecked(name),
+                    simple_dns::CLASS::IN,
+                    60,
+                    simple_dns::rdata::RData::A(simple_dns::rdata::A { address: Ipv4Addr::new(10, 0, 0, i).into() }),
+                ));
             }
             packet.build_bytes_vec().expect("test packet should always serialize")
         }
@@ -614,7 +629,8 @@ mod live_smoke {
 
         let bpffs_root = PathBuf::from(BPFFS_ROOT_SIZES);
         let _ = Probe::unpin_all_at(&bpffs_root);
-        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone()).expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection of the clamp-then-mask capture would surface here");
+        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone())
+            .expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection of the clamp-then-mask capture would surface here");
 
         let outcome: Result<Vec<(String, usize, usize, usize)>, String> = (|| {
             probe.attach_container(Path::new(CGROUP_PATH)).map_err(|e| format!("attach_container failed: {e:#}"))?;
@@ -631,7 +647,8 @@ mod live_smoke {
             // of build chunk #9's old literal-tier gaps (64/128 and
             // 384/512 respectively); `over_cap` deliberately exceeds
             // `DNS_CAPTURE_MAX` to exercise the cap-truncation path too.
-            let cases: [(&str, u16, &str, u8); 4] = [("baseline", 0xAAAA, "ex.com.", 1), ("tier_gap", 0xBBBB, "tier-gap.example.com.", 1), ("mid_gap", 0xCCCC, "mid.example.com.", 14), ("over_cap", 0xDDDD, "mid.example.com.", 20)];
+            let cases: [(&str, u16, &str, u8); 4] =
+                [("baseline", 0xAAAA, "ex.com.", 1), ("tier_gap", 0xBBBB, "tier-gap.example.com.", 1), ("mid_gap", 0xCCCC, "mid.example.com.", 14), ("over_cap", 0xDDDD, "mid.example.com.", 20)];
 
             let mut results = Vec::new();
             for (label, txid, name, n) in cases {
@@ -695,7 +712,10 @@ mod live_smoke {
 
         let (_, tier_gap_sent, tier_gap_captured, tier_gap_answers) = by_label("tier_gap");
         assert!(*tier_gap_sent > 64 && *tier_gap_sent < 128, "sanity: this case must actually be sized into the old 64/128 tier gap");
-        assert_eq!(tier_gap_sent, tier_gap_captured, "THE regression this build chunk fixes: a response sized strictly between two old literal tiers must now be captured at its OWN exact length, not truncated to the smaller tier");
+        assert_eq!(
+            tier_gap_sent, tier_gap_captured,
+            "THE regression this build chunk fixes: a response sized strictly between two old literal tiers must now be captured at its OWN exact length, not truncated to the smaller tier"
+        );
         assert_eq!(*tier_gap_answers, 1, "and it must therefore parse completely");
 
         let (_, mid_gap_sent, mid_gap_captured, mid_gap_answers) = by_label("mid_gap");
@@ -706,9 +726,15 @@ mod live_smoke {
         let (_, over_cap_sent, over_cap_captured, over_cap_answers) = by_label("over_cap");
         assert!(*over_cap_sent > DNS_CAPTURE_MAX, "sanity: this case must actually exceed the capture cap");
         assert_eq!(*over_cap_captured, DNS_CAPTURE_MAX, "an over-cap response must be captured up to exactly the cap, not tier-truncated below it");
-        assert!(*over_cap_answers > 0 && *over_cap_answers < 20, "the tolerant parser must recover the complete answers that fit within the cap-truncated bytes, but not fabricate the ones that don't");
+        assert!(
+            *over_cap_answers > 0 && *over_cap_answers < 20,
+            "the tolerant parser must recover the complete answers that fit within the cap-truncated bytes, but not fabricate the ones that don't"
+        );
 
-        eprintln!("dns live_smoke (varying sizes): FULL PROOF -- clamp-then-mask exact-length capture verified live across {} sizes, including the old 64/128 and 384/512 tier gaps and one over-cap case", results.len());
+        eprintln!(
+            "dns live_smoke (varying sizes): FULL PROOF -- clamp-then-mask exact-length capture verified live across {} sizes, including the old 64/128 and 384/512 tier gaps and one over-cap case",
+            results.len()
+        );
     }
 }
 

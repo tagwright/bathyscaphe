@@ -71,7 +71,16 @@ mod tests {
         attach_with_enforcement(&mut probe, 100, Mode::Block, 1);
 
         let mut state = DaemonState::new();
-        state.upsert(ContainerState { container_id: "c1".to_string(), cgroup_id: 100, mode: Mode::Block, generation: 1, default: DefaultVerdict::Deny, rules_active: 1, rules_inert: 0, orphaned: false });
+        state.upsert(ContainerState {
+            container_id: "c1".to_string(),
+            cgroup_id: 100,
+            mode: Mode::Block,
+            generation: 1,
+            default: DefaultVerdict::Deny,
+            rules_active: 1,
+            rules_inert: 0,
+            orphaned: false,
+        });
 
         mark_orphans(&mut state, &probe, |_| None);
         assert!(!state.containers["c1"].orphaned);
@@ -85,7 +94,10 @@ mod tests {
         let mut state = DaemonState::new();
         // Simulate a previous session's tracked state that was NOT
         // re-covered by a `policy`/`release` before `sync_complete` fired.
-        state.containers.insert("c2".to_string(), ContainerState { container_id: "c2".to_string(), cgroup_id: 200, mode: Mode::Block, generation: 5, default: DefaultVerdict::Deny, rules_active: 1, rules_inert: 0, orphaned: false });
+        state.containers.insert(
+            "c2".to_string(),
+            ContainerState { container_id: "c2".to_string(), cgroup_id: 200, mode: Mode::Block, generation: 5, default: DefaultVerdict::Deny, rules_active: 1, rules_inert: 0, orphaned: false },
+        );
         state.by_cgroup_id.insert(200, "c2".to_string());
         // covered_since_last_sync deliberately left empty for "c2".
 

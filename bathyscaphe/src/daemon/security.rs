@@ -24,8 +24,8 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use bathyscaphe_proto::security::{Severity, SecurityContainer, SecurityRecord, reason};
 use bathyscaphe_proto::UpMessage;
+use bathyscaphe_proto::security::{SecurityContainer, SecurityRecord, Severity, reason};
 
 use super::throttle::TokenBucket;
 use crate::pipeline::EventSink;
@@ -90,7 +90,9 @@ pub fn name_unresolved_block_record(timestamp: String, container: SecurityContai
     let mut record = SecurityRecord::new(
         timestamp,
         Severity::Error,
-        format!("denied a connection to {dst_addr}:{dst_port}: this container has an active allow-listed name rule, but no DNS answer was ever observed for this destination (raw-IP egress, or a DoH/DoT/ECH lookup this build cannot see)"),
+        format!(
+            "denied a connection to {dst_addr}:{dst_port}: this container has an active allow-listed name rule, but no DNS answer was ever observed for this destination (raw-IP egress, or a DoH/DoT/ECH lookup this build cannot see)"
+        ),
         reason::POLICY_NAME_UNRESOLVED_BLOCK,
         container,
         None,
@@ -118,7 +120,9 @@ pub fn dns_untrusted_answer_record(timestamp: String, container: SecurityContain
     let mut record = SecurityRecord::new(
         timestamp,
         Severity::Warning,
-        format!("a DNS answer for {domain:?} arrived from {src_addr}, which is not in the trusted-resolver set, and would have matched an active allow-listed name rule; the answer was NOT used to seed enforcement"),
+        format!(
+            "a DNS answer for {domain:?} arrived from {src_addr}, which is not in the trusted-resolver set, and would have matched an active allow-listed name rule; the answer was NOT used to seed enforcement"
+        ),
         reason::DNS_UNTRUSTED_ANSWER,
         container,
         None,
@@ -134,7 +138,15 @@ pub fn dns_untrusted_answer_record(timestamp: String, container: SecurityContain
 /// `Error` once a container has actually been escalated, while an ordinary
 /// sub-threshold drop reports at `Warning`.
 pub fn tamper_event_drops_record(timestamp: String, container: SecurityContainer<'_>, dropped_delta: u64, dropped_total: u64, severity: Severity) -> SecurityRecord {
-    let mut record = SecurityRecord::new(timestamp, severity, format!("{dropped_delta} event(s) dropped since the last report ({dropped_total} total for this container)"), reason::TAMPER_EVENT_DROPS, container, None, None);
+    let mut record = SecurityRecord::new(
+        timestamp,
+        severity,
+        format!("{dropped_delta} event(s) dropped since the last report ({dropped_total} total for this container)"),
+        reason::TAMPER_EVENT_DROPS,
+        container,
+        None,
+        None,
+    );
     record.attributes.insert("dropped_delta".to_string(), serde_json::Value::from(dropped_delta));
     record.attributes.insert("dropped_total".to_string(), serde_json::Value::from(dropped_total));
     record

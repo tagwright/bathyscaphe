@@ -39,7 +39,10 @@ enum RawLine {
     /// exceeded [`MAX_LINE_BYTES`]; `bytes` is truncated/empty in that
     /// case (no point buffering megabytes we're about to discard as
     /// malformed anyway).
-    Line { bytes: Vec<u8>, too_long: bool },
+    Line {
+        bytes: Vec<u8>,
+        too_long: bool,
+    },
 }
 
 /// Reads one `\n`-terminated line from `reader`, bounding how much of an

@@ -345,10 +345,7 @@ mod tests {
             let stored_a = build_policy_key(cgroup_a, addr, bits_over).unwrap();
             let lookup_b = build_policy_key(cgroup_b, addr, PolicyKeyData::ADDR_BITS).unwrap(); // full lookup key, as the kernel always uses
 
-            assert!(
-                !lpm_would_match(&stored_a, &lookup_b),
-                "a stored entry for cgroup {cgroup_a:016x} matched a lookup for cgroup {cgroup_b:016x} at bits_over={bits_over}"
-            );
+            assert!(!lpm_would_match(&stored_a, &lookup_b), "a stored entry for cgroup {cgroup_a:016x} matched a lookup for cgroup {cgroup_b:016x} at bits_over={bits_over}");
         }
     }
 

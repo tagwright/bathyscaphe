@@ -171,7 +171,12 @@ fn extract_txid(bytes: &[u8]) -> Option<u16> {
 /// means every consumer sees the SAME trust signal and decides for itself
 /// how much to weight it, rather than this shared plumbing baking in one
 /// consumer's policy.
-pub fn capture_callback(cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<PendingQueryTable>>, trusted_resolvers: Arc<TrustedResolvers>, mut on_answer: impl FnMut(AttributedAnswer) + Send + 'static) -> Box<dyn FnMut(DnsCapture) + Send + 'static> {
+pub fn capture_callback(
+    cache: Arc<Mutex<DomainCache>>,
+    pending: Arc<Mutex<PendingQueryTable>>,
+    trusted_resolvers: Arc<TrustedResolvers>,
+    mut on_answer: impl FnMut(AttributedAnswer) + Send + 'static,
+) -> Box<dyn FnMut(DnsCapture) + Send + 'static> {
     let last_ambiguous_log_ns = std::sync::atomic::AtomicU64::new(0);
     Box::new(move |capture: DnsCapture| {
         let Some(parsed) = parse::parse_dns_response(capture.captured()) else {
@@ -435,7 +440,12 @@ mod tests {
         let mut packet = simple_dns::Packet::new_reply(txid);
         packet.set_flags(simple_dns::PacketFlag::RESPONSE);
         packet.questions.push(simple_dns::Question::new(simple_dns::Name::new_unchecked(name).into_owned(), simple_dns::TYPE::A.into(), simple_dns::CLASS::IN.into(), false));
-        packet.answers.push(simple_dns::ResourceRecord::new(simple_dns::Name::new_unchecked(name), simple_dns::CLASS::IN, ttl, simple_dns::rdata::RData::A(simple_dns::rdata::A { address: std::net::Ipv4Addr::from(addr).into() })));
+        packet.answers.push(simple_dns::ResourceRecord::new(
+            simple_dns::Name::new_unchecked(name),
+            simple_dns::CLASS::IN,
+            ttl,
+            simple_dns::rdata::RData::A(simple_dns::rdata::A { address: std::net::Ipv4Addr::from(addr).into() }),
+        ));
         packet.build_bytes_vec().expect("test packet should always serialize")
     }
 }

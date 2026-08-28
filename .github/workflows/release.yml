@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Builds and publishes the bathyscaphe image on a `v*` tag. The Dockerfile
+# does its own toolchain setup inside the build stage (nightly + rust-src +
+# the pinned bpf-linker tarball, per docs/BUILDING.md), so this workflow
+# itself needs nothing Rust-specific -- just Buildx and a registry login.
+#
+# Two gotchas, carried over from the tagwright Build Playbook, not yet
+# resolved by anything in this workflow:
+#
+#   1. ghcr package visibility defaults to PRIVATE on first publish. Someone
+#      with admin on the tagwright org has to flip
+#      ghcr.io/tagwright/bathyscaphe to PUBLIC once, by hand, after this
+#      workflow's first successful run -- there's no API/workflow step that
+#      does this from here.
+#   2. The published image tag comes from the git tag (`v0.1.0`, etc, via
+#      metadata-action below), but the bathyscaphe BINARY's own version
+#      string is read at compile time from the repository's `VERSION` file
+#      (currently `00.01.00b1`), which this workflow does NOT touch. A real
+#      release needs those two reconciled first -- bump `VERSION` to match
+#      before cutting the tag, or extend the Dockerfile to accept a
+#      build-arg that overwrites `VERSION` at build time. Neither is done
+#      yet; `bathyscaphe version` inside a `v0.1.0`-tagged image will still
+#      print `00.01.00b1` until one of those lands.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/tagwright/bathyscaphe
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

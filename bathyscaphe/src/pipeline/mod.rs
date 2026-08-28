@@ -87,7 +87,10 @@ where
         match map_event(&kernel_event, &self.attributor, &self.tamper, &self.domain_lookup, &self.dropped, self.boot_offset_ns) {
             Some(wire_event) => self.sink.emit(UpMessage::Event(wire_event)),
             None => {
-                eprintln!("bathyscaphe: dropping one event with no resolvable container attribution at all for cgroup {:016x} (not a ring-buffer loss; see pipeline::map::map_event's doc)", kernel_event.cgroup_id);
+                eprintln!(
+                    "bathyscaphe: dropping one event with no resolvable container attribution at all for cgroup {:016x} (not a ring-buffer loss; see pipeline::map::map_event's doc)",
+                    kernel_event.cgroup_id
+                );
             }
         }
     }

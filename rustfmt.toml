@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# The workspace's established style favors long single-line expressions
+# (method chains, struct literals, match arms) over rustfmt's stock 100-column
+# wrap. This file makes `cargo fmt --check` (CI's job) agree with what every
+# file up to this chunk already looks like, instead of the two fighting each
+# other. Options here are deliberately limited to what stable rustfmt
+# supports (no nightly-only knobs), since docs/BUILDING.md's proven toolchain
+# runs `cargo fmt` on the stable default toolchain, not nightly.
+max_width = 200
+use_small_heuristics = "Max"

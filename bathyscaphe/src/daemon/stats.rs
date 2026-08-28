@@ -32,7 +32,7 @@ use crate::pipeline::EventSink;
 
 use super::probe_api::ProbeApi;
 use super::r2::{DropEscalationConfig, DropTracker, EscalationAction, EscalationDecision};
-use super::security::{enforce_blocked_summary_record, tamper_event_drops_record, SecurityEmitter};
+use super::security::{SecurityEmitter, enforce_blocked_summary_record, tamper_event_drops_record};
 use super::state::DaemonState;
 
 /// Wraps an inner [`EventSink`] to count every `Event` message that passes
@@ -67,9 +67,7 @@ impl<S: EventSink> EventSink for CountingSink<S> {
 }
 
 pub(super) fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 fn mode_to_wire(mode: Mode) -> bathyscaphe_proto::Mode {
@@ -129,7 +127,17 @@ fn container_stats(probe: &dyn ProbeApi, state: &DaemonState) -> Vec<ContainerSt
 /// stays testable with a synthetic clock, the same convention
 /// `daemon::compile::compile_policy`'s `resolve_expiry` parameter uses.
 #[allow(clippy::too_many_arguments)]
-pub fn tick(runtime: &mut StatsRuntime, probe: &mut dyn ProbeApi, state: &mut DaemonState, attributor: &dyn Attributor, security: &SecurityEmitter, sink: &mut dyn EventSink, r2_config: &DropEscalationConfig, stats_interval_s: u64, now_boottime_ns: u64) -> Stats {
+pub fn tick(
+    runtime: &mut StatsRuntime,
+    probe: &mut dyn ProbeApi,
+    state: &mut DaemonState,
+    attributor: &dyn Attributor,
+    security: &SecurityEmitter,
+    sink: &mut dyn EventSink,
+    r2_config: &DropEscalationConfig,
+    stats_interval_s: u64,
+    now_boottime_ns: u64,
+) -> Stats {
     runtime.seq += 1;
     let timestamp = now_rfc3339();
     let mut events_dropped_total = 0u64;
@@ -176,7 +184,14 @@ pub fn tick(runtime: &mut StatsRuntime, probe: &mut dyn ProbeApi, state: &mut Da
         security.try_emit(sink, enforce_blocked_summary_record(timestamp.clone(), container, count));
     }
 
-    Stats { ts: timestamp, seq: runtime.seq, uptime_s: runtime.started_at.elapsed().as_secs(), events_emitted: runtime.events_emitted.load(Ordering::Relaxed), events_dropped_total, containers: container_stats(probe, state) }
+    Stats {
+        ts: timestamp,
+        seq: runtime.seq,
+        uptime_s: runtime.started_at.elapsed().as_secs(),
+        events_emitted: runtime.events_emitted.load(Ordering::Relaxed),
+        events_dropped_total,
+        containers: container_stats(probe, state),
+    }
 }
 
 /// Applies an R2 escalation decision. [`EscalationAction::Exit`] calls
@@ -242,7 +257,16 @@ mod tests {
         probe.set_enforcement(1, Mode::Block, DefaultVerdict::Deny, 3).unwrap();
         probe.set_policy(1, IpAddr::from([10, 0, 0, 0]), 0, PolicyValue::new(1, 0, 0)).unwrap();
         let mut state = DaemonState::new();
-        state.upsert(ContainerState { container_id: "c1".to_string(), cgroup_id: 1, mode: Mode::Block, generation: 3, default: DefaultVerdict::Deny, rules_active: 1, rules_inert: 0, orphaned: false });
+        state.upsert(ContainerState {
+            container_id: "c1".to_string(),
+            cgroup_id: 1,
+            mode: Mode::Block,
+            generation: 3,
+            default: DefaultVerdict::Deny,
+            rules_active: 1,
+            rules_inert: 0,
+            orphaned: false,
+        });
         (probe, state)
     }
 

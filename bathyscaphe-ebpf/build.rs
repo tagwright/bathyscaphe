@@ -13,8 +13,5 @@ use which::which;
 
 fn main() {
     let bpf_linker = which("bpf-linker").expect("bpf-linker not found in PATH");
-    println!(
-        "cargo:rerun-if-changed={}",
-        bpf_linker.to_str().expect("bpf-linker path is not UTF-8")
-    );
+    println!("cargo:rerun-if-changed={}", bpf_linker.to_str().expect("bpf-linker path is not UTF-8"));
 }

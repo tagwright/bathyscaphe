@@ -77,7 +77,10 @@ pub fn run(args: RunArgs, logger: &Logger) -> ExitCode {
             "the trusted-resolver set resolved to EMPTY -- no DNS answer from any source will ever seed FQDN name-rule enforcement until --trusted-resolver is set; IP/CIDR policy is unaffected and enforcement never silently widens, but every name rule in mode: block will fail closed for every container until this is fixed",
         );
     } else {
-        logger.info("cli.run.trusted_resolvers", &format!("trusted DNS resolver set ({} address(es)): {:?}", trusted_resolvers.len(), trusted_resolvers.iter().map(|a| a.to_string()).collect::<Vec<_>>()));
+        logger.info(
+            "cli.run.trusted_resolvers",
+            &format!("trusted DNS resolver set ({} address(es)): {:?}", trusted_resolvers.len(), trusted_resolvers.iter().map(|a| a.to_string()).collect::<Vec<_>>()),
+        );
     }
 
     let config = build_config(&args, super::VERSION.trim(), trusted_resolvers);
@@ -115,7 +118,15 @@ mod tests {
     use std::path::PathBuf;
 
     fn base_args() -> RunArgs {
-        RunArgs { bpffs_root: None, cgroup_root: None, fail_closed_on_drops: false, drop_threshold_per_sec: 10.0, drop_window_secs: 60, drop_action: DropActionArg::Lockdown, trusted_resolver: Vec::new() }
+        RunArgs {
+            bpffs_root: None,
+            cgroup_root: None,
+            fail_closed_on_drops: false,
+            drop_threshold_per_sec: 10.0,
+            drop_window_secs: 60,
+            drop_action: DropActionArg::Lockdown,
+            trusted_resolver: Vec::new(),
+        }
     }
 
     fn empty_trusted_resolvers() -> crate::dns::TrustedResolvers {

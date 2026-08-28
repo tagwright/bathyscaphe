@@ -247,11 +247,7 @@ struct Group {
 
 fn merge_action_deny_wins(existing: Option<u8>, incoming: u8) -> u8 {
     let deny = bathyscaphe_common::RuleAction::Deny as u8;
-    if existing == Some(deny) || incoming == deny {
-        deny
-    } else {
-        existing.unwrap_or(incoming)
-    }
+    if existing == Some(deny) || incoming == deny { deny } else { existing.unwrap_or(incoming) }
 }
 
 /// Compiles one `policy` directive. `resolve_expiry` converts a rule's
@@ -282,7 +278,13 @@ pub fn compile_policy(policy: &Policy, resolve_expiry: impl Fn(&str) -> Option<u
                 inert_rules += 1;
             }
             Match::Name { pattern, port, proto, .. } => {
-                name_patterns.push(CompiledNamePattern { rule_id: rule.id.clone(), pattern: normalize_name(pattern), action: convert_action(rule.action), port: *port, proto: proto.map(convert_transport) });
+                name_patterns.push(CompiledNamePattern {
+                    rule_id: rule.id.clone(),
+                    pattern: normalize_name(pattern),
+                    action: convert_action(rule.action),
+                    port: *port,
+                    proto: proto.map(convert_transport),
+                });
             }
             Match::Unknown => {
                 inert_rules += 1;
@@ -341,9 +343,14 @@ pub fn compile_policy(policy: &Policy, resolve_expiry: impl Fn(&str) -> Option<u
         let mut value = PolicyValue::new(cidr_default_action, source_raw, expires_at_ns);
         for (port_lo, port_hi, proto_raw) in group.port_rules.keys().copied().collect::<Vec<_>>() {
             let action_raw = group.port_rules[&(port_lo, port_hi, proto_raw)];
-            value = value
-                .with_port_rule(PortRule::new(port_lo, port_hi, proto_raw, action_raw))
-                .map_err(|_| CompileError(format!("destination prefix at {}/{} needs more than {} port rules (MAX_PORT_RULES); split it into an additional, narrower rule instead of relying on aggregation", unmap_addr(addr_bytes), prefix_bits_over_addr, PolicyValue::MAX_PORT_RULES)))?;
+            value = value.with_port_rule(PortRule::new(port_lo, port_hi, proto_raw, action_raw)).map_err(|_| {
+                CompileError(format!(
+                    "destination prefix at {}/{} needs more than {} port rules (MAX_PORT_RULES); split it into an additional, narrower rule instead of relying on aggregation",
+                    unmap_addr(addr_bytes),
+                    prefix_bits_over_addr,
+                    PolicyValue::MAX_PORT_RULES
+                ))
+            })?;
         }
         entries.push(CompiledEntry { addr: unmap_addr(addr_bytes), prefix_bits_over_addr, value });
     }
@@ -484,7 +491,13 @@ mod tests {
     fn a_name_rule_with_an_unrecognized_field_is_still_inert_and_counted() {
         let mut unknown = serde_json::Map::new();
         unknown.insert("weird_field".to_string(), serde_json::Value::Bool(true));
-        let rule = Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown }, expires_at: None, source: WireSource::Static };
+        let rule = Rule {
+            id: "r1".to_string(),
+            action: WireAction::Allow,
+            r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown },
+            expires_at: None,
+            source: WireSource::Static,
+        };
         let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![rule]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
         assert_eq!(compiled.inert_rules, 1, "an unrecognized field inside a name matcher is still the one ignore-unknown carve-out");
@@ -506,7 +519,8 @@ mod tests {
 
     #[test]
     fn unknown_match_type_is_inert_and_counted() {
-        let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Unknown, expires_at: None, source: WireSource::Static }]);
+        let policy =
+            base_policy(WireMode::Alert, WireDefault::Allow, vec![Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Unknown, expires_at: None, source: WireSource::Static }]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
         assert_eq!(compiled.inert_rules, 1);
     }
@@ -515,7 +529,13 @@ mod tests {
     fn cidr_rule_with_captured_unknown_field_is_inert_and_not_enforced() {
         let mut unknown = serde_json::Map::new();
         unknown.insert("weird_field".to_string(), serde_json::Value::Bool(true));
-        let rule = Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Cidr { cidr: "10.0.0.0/8".to_string(), port: None, proto: None, unknown }, expires_at: None, source: WireSource::Static };
+        let rule = Rule {
+            id: "r1".to_string(),
+            action: WireAction::Allow,
+            r#match: Match::Cidr { cidr: "10.0.0.0/8".to_string(), port: None, proto: None, unknown },
+            expires_at: None,
+            source: WireSource::Static,
+        };
         let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![rule]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
         assert_eq!(compiled.inert_rules, 1);
@@ -574,13 +594,7 @@ mod tests {
         let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![r1, r2]);
 
         // A trivial resolver: earlier year -> smaller boottime ns.
-        let resolve = |s: &str| -> Option<u64> {
-            if s.starts_with("2025") {
-                Some(100)
-            } else {
-                Some(200)
-            }
-        };
+        let resolve = |s: &str| -> Option<u64> { if s.starts_with("2025") { Some(100) } else { Some(200) } };
         let compiled = compile_policy(&policy, resolve).expect("compiles");
         let entry = find_entry(&compiled, "10.0.0.0", 96 + 24);
         assert_eq!(entry.value.expires_at_ns, 100, "the soonest constituent expiry wins");

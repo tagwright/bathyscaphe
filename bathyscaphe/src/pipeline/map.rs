@@ -23,7 +23,14 @@ use super::sink::{DomainLookupSource, TamperSource};
 /// attached to a cgroup this process already resolved once, to attach to
 /// it) -- see [`Attributor::resolve`]'s doc for exactly when it can still
 /// occur.
-pub fn map_event(kernel_event: &bathyscaphe_common::Event, attributor: &impl Attributor, tamper: &impl TamperSource, domain_lookup: &impl DomainLookupSource, dropped: &DroppedTracker, boot_offset_ns: i128) -> Option<WireEvent> {
+pub fn map_event(
+    kernel_event: &bathyscaphe_common::Event,
+    attributor: &impl Attributor,
+    tamper: &impl TamperSource,
+    domain_lookup: &impl DomainLookupSource,
+    dropped: &DroppedTracker,
+    boot_offset_ns: i128,
+) -> Option<WireEvent> {
     let attribution = attributor.resolve(kernel_event.cgroup_id)?;
 
     let container = Container { id: attribution.container_id, name: attribution.name, image: attribution.image, runtime: attribution.runtime };
@@ -173,13 +180,10 @@ fn unmap_addr(raw: [u8; 16]) -> IpAddr {
 /// formatter already exceeds that floor.
 fn format_ts(ktime_ns: u64, boot_offset_ns: i128) -> String {
     let unix_ns = boot_offset_ns.saturating_add(i128::from(ktime_ns));
-    time::OffsetDateTime::from_unix_timestamp_nanos(unix_ns)
-        .ok()
-        .and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok())
-        .unwrap_or_else(|| {
-            eprintln!("bathyscaphe: could not format event timestamp (ktime_ns={ktime_ns}, boot_offset_ns={boot_offset_ns}); this should not happen on a sane clock");
-            "1970-01-01T00:00:00Z".to_string()
-        })
+    time::OffsetDateTime::from_unix_timestamp_nanos(unix_ns).ok().and_then(|dt| dt.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| {
+        eprintln!("bathyscaphe: could not format event timestamp (ktime_ns={ktime_ns}, boot_offset_ns={boot_offset_ns}); this should not happen on a sane clock");
+        "1970-01-01T00:00:00Z".to_string()
+    })
 }
 
 #[cfg(test)]

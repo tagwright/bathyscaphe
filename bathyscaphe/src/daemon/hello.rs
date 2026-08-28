@@ -6,7 +6,7 @@
 //! per `docs/PROTOCOL.md` section 2).
 
 use bathyscaphe_common::{DefaultVerdict, Mode};
-use bathyscaphe_proto::{Capability, Hello, PinnedContainer, PROTO_VERSION};
+use bathyscaphe_proto::{Capability, Hello, PROTO_VERSION, PinnedContainer};
 
 use super::probe_api::ProbeApi;
 
@@ -53,7 +53,13 @@ pub fn pinned_inventory(probe: &dyn ProbeApi, resolve_container_id: impl Fn(u64)
 }
 
 pub fn build_hello(probe: &dyn ProbeApi, resolve_container_id: impl Fn(u64) -> Option<String>, backend_version: &str) -> Hello {
-    Hello { backend: "bathyscaphe".to_string(), backend_version: backend_version.to_string(), proto_versions: vec![PROTO_VERSION], capabilities: capabilities(), pinned: pinned_inventory(probe, resolve_container_id) }
+    Hello {
+        backend: "bathyscaphe".to_string(),
+        backend_version: backend_version.to_string(),
+        proto_versions: vec![PROTO_VERSION],
+        capabilities: capabilities(),
+        pinned: pinned_inventory(probe, resolve_container_id),
+    }
 }
 
 #[cfg(test)]

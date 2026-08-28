@@ -239,7 +239,8 @@ mod live_smoke {
         let bpffs_root = PathBuf::from(BPFFS_ROOT);
         let _ = Probe::unpin_all_at(&bpffs_root);
 
-        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone()).expect("fresh load_or_reopen should load, pin, and reopen cleanly for all SEVEN programs including dns_query_snoop -- a verifier rejection surfaces here");
+        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone())
+            .expect("fresh load_or_reopen should load, pin, and reopen cleanly for all SEVEN programs including dns_query_snoop -- a verifier rejection surfaces here");
 
         let container_id = match create_and_start_test_container() {
             Ok(id) => id,
@@ -262,7 +263,8 @@ mod live_smoke {
                 std::thread::sleep(Duration::from_millis(50));
             };
 
-            let container_cgroup_id = probe.attach_container(&cgroup_path).map_err(|e| format!("attach_container failed (this is where a verifier rejection of dns_query_snoop or dns_snoop would surface): {e:#}"))?;
+            let container_cgroup_id =
+                probe.attach_container(&cgroup_path).map_err(|e| format!("attach_container failed (this is where a verifier rejection of dns_query_snoop or dns_snoop would surface): {e:#}"))?;
 
             let mut query_ring = probe.take_dns_queries().ok_or("DNS query ring buffer already taken")?;
             let mut answer_ring = probe.take_dns_events().ok_or("DNS answer ring buffer already taken")?;
@@ -356,7 +358,10 @@ mod live_smoke {
 
         match outcome.expect("attach_container must succeed (verifier acceptance for all seven programs) and BOTH the query and answer snoops must capture SOMETHING; see docs/TESTING.md") {
             FqdnSmokeOutcome::FullCorrelationProof { query_cgroup_matched_container, response_own_cgroup_matched_container, correlated_cgroup_matched_container } => {
-                assert!(query_cgroup_matched_container, "the egress query snoop MUST fire in the container's own cgroup -- this is the entire premise of the correlation fix, and a failure here is a real defect, not a tolerated confound");
+                assert!(
+                    query_cgroup_matched_container,
+                    "the egress query snoop MUST fire in the container's own cgroup -- this is the entire premise of the correlation fix, and a failure here is a real defect, not a tolerated confound"
+                );
                 assert!(correlated_cgroup_matched_container, "query/response correlation MUST recover the container's cgroup id for every captured answer");
                 eprintln!(
                     "fqdn live_smoke: FULL PROOF -- egress query snoop correctly attributed to the container's own cgroup in every case; response's OWN cgroup attribution matched the container in {} case(s) (chunk #9's docker.service misattribution {}); correlation recovered the correct container cgroup in every case regardless",
@@ -365,7 +370,9 @@ mod live_smoke {
                 );
             }
             FqdnSmokeOutcome::NoQueryCaptured => panic!("dns_query_snoop captured NOTHING at all within the deadline -- this DOES indicate a capture-logic problem, not a tolerable confound"),
-            FqdnSmokeOutcome::NoResponseCaptured => panic!("dns_snoop captured NOTHING at all within the deadline -- this DOES indicate a capture-logic problem (chunk #9 already proved this path works on this host)"),
+            FqdnSmokeOutcome::NoResponseCaptured => {
+                panic!("dns_snoop captured NOTHING at all within the deadline -- this DOES indicate a capture-logic problem (chunk #9 already proved this path works on this host)")
+            }
         }
     }
 }

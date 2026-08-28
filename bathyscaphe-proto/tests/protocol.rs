@@ -8,11 +8,9 @@
 //! field being renamed to something that still round-trips with itself.
 
 use bathyscaphe_proto::{
-    decode_line, encode_line, security::reason, Capability, Container, DefaultVerdict, Domain, DownMessage, Endpoint,
-    ErrorMsg, Event, EventKind, EventMeta, Hello, Match, Mode, PinnedContainer, Policy, PolicyAck, PolicyAckStatus,
-    Process, Release, ReleaseAck, ReleaseAll, ReleaseStatus, Rule, RuleAction, RuleSource, Runtime, SecurityContainer,
-    SecurityRecord, Severity, Shutdown, Start, Stats, ContainerStats, SyncComplete, TransportProto, UpMessage,
-    Verdict, PROTO_VERSION,
+    Capability, Container, ContainerStats, DefaultVerdict, Domain, DownMessage, Endpoint, ErrorMsg, Event, EventKind, EventMeta, Hello, Match, Mode, PROTO_VERSION, PinnedContainer, Policy, PolicyAck,
+    PolicyAckStatus, Process, Release, ReleaseAck, ReleaseAll, ReleaseStatus, Rule, RuleAction, RuleSource, Runtime, SecurityContainer, SecurityRecord, Severity, Shutdown, Start, Stats, SyncComplete,
+    TransportProto, UpMessage, Verdict, decode_line, encode_line, security::reason,
 };
 
 fn sample_hello() -> Hello {
@@ -21,13 +19,7 @@ fn sample_hello() -> Hello {
         backend_version: "0.1.0".to_string(),
         proto_versions: vec![PROTO_VERSION],
         capabilities: vec![Capability::Observe, Capability::Enforce, Capability::EnforceUdp],
-        pinned: vec![PinnedContainer {
-            container_id: "a1b2c3d4e5f6".to_string(),
-            cgroup_id: 48291,
-            generation: 42,
-            mode: Mode::Block,
-            rules: 17,
-        }],
+        pinned: vec![PinnedContainer { container_id: "a1b2c3d4e5f6".to_string(), cgroup_id: 48291, generation: 42, mode: Mode::Block, rules: 17 }],
     }
 }
 
@@ -36,19 +28,8 @@ fn sample_event() -> Event {
         ts: "2026-08-27T12:00:03.482910Z".to_string(),
         event: EventKind::Connect,
         proto: TransportProto::Tcp,
-        container: Container {
-            id: "cid-1".to_string(),
-            name: Some("renovate-1".to_string()),
-            image: Some("renovate/renovate:41".to_string()),
-            runtime: Runtime::Docker,
-        },
-        process: Process {
-            pid: Some(675195),
-            tid: Some(675195),
-            uid: Some(0),
-            gid: Some(0),
-            comm: Some("node".to_string()),
-        },
+        container: Container { id: "cid-1".to_string(), name: Some("renovate-1".to_string()), image: Some("renovate/renovate:41".to_string()), runtime: Runtime::Docker },
+        process: Process { pid: Some(675195), tid: Some(675195), uid: Some(0), gid: Some(0), comm: Some("node".to_string()) },
         src: Endpoint { addr: "172.17.0.5".parse().unwrap(), port: 51234 },
         dst: Endpoint { addr: "140.82.121.6".parse().unwrap(), port: 443 },
         verdict: Verdict::Allow,
@@ -65,27 +46,12 @@ fn sample_stats() -> Stats {
         uptime_s: 310,
         events_emitted: 4821,
         events_dropped_total: 0,
-        containers: vec![ContainerStats {
-            id: "cid-1".to_string(),
-            mode: Mode::Block,
-            generation: 43,
-            enforcing: true,
-            rules_active: 4,
-            rules_inert: 1,
-            dropped_total: 0,
-            orphaned: false,
-        }],
+        containers: vec![ContainerStats { id: "cid-1".to_string(), mode: Mode::Block, generation: 43, enforcing: true, rules_active: 4, rules_inert: 1, dropped_total: 0, orphaned: false }],
     }
 }
 
 fn sample_policy_ack() -> PolicyAck {
-    PolicyAck {
-        container_id: "cid-1".to_string(),
-        generation: 43,
-        status: PolicyAckStatus::Applied,
-        inert_rules: 1,
-        error: None,
-    }
+    PolicyAck { container_id: "cid-1".to_string(), generation: 43, status: PolicyAckStatus::Applied, inert_rules: 1, error: None }
 }
 
 fn sample_release_ack() -> ReleaseAck {
@@ -117,12 +83,7 @@ fn sample_policy() -> Policy {
         rules: vec![Rule {
             id: "r-gh-api".to_string(),
             action: RuleAction::Allow,
-            r#match: Match::Cidr {
-                cidr: "140.82.121.0/24".to_string(),
-                port: Some(443),
-                proto: Some(TransportProto::Tcp),
-                unknown: serde_json::Map::new(),
-            },
+            r#match: Match::Cidr { cidr: "140.82.121.0/24".to_string(), port: Some(443), proto: Some(TransportProto::Tcp), unknown: serde_json::Map::new() },
             expires_at: None,
             source: RuleSource::Static,
         }],
@@ -169,13 +130,7 @@ fn policy_ack_round_trips() {
 
 #[test]
 fn policy_ack_error_round_trips() {
-    round_trip_up(UpMessage::PolicyAck(PolicyAck {
-        container_id: "cid-1".to_string(),
-        generation: 44,
-        status: PolicyAckStatus::Error,
-        inert_rules: 0,
-        error: Some("unknown container".to_string()),
-    }));
+    round_trip_up(UpMessage::PolicyAck(PolicyAck { container_id: "cid-1".to_string(), generation: 44, status: PolicyAckStatus::Error, inert_rules: 0, error: Some("unknown container".to_string()) }));
 }
 
 #[test]
@@ -213,12 +168,7 @@ fn policy_with_name_rule_round_trips() {
         rules: vec![Rule {
             id: "r-gh-name".to_string(),
             action: RuleAction::Allow,
-            r#match: Match::Name {
-                pattern: "*.github.com".to_string(),
-                port: Some(443),
-                proto: Some(TransportProto::Tcp),
-                unknown: serde_json::Map::new(),
-            },
+            r#match: Match::Name { pattern: "*.github.com".to_string(), port: Some(443), proto: Some(TransportProto::Tcp), unknown: serde_json::Map::new() },
             expires_at: Some("2026-08-27T12:05:00Z".to_string()),
             source: RuleSource::Dns,
         }],

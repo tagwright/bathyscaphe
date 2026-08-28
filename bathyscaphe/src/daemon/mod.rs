@@ -93,10 +93,10 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bathyscaphe_proto::down::DownMessage;
 use bathyscaphe_proto::UpMessage;
+use bathyscaphe_proto::down::DownMessage;
 
-use crate::attribution::{Attributor, AttributionService};
+use crate::attribution::{AttributionService, Attributor};
 use crate::dns::{DomainCache, NamePatternStore, PendingQueryTable, TrustedResolvers};
 use crate::pipeline::{EventSink, Pipeline};
 use crate::probe::{DnsCaptureConsumer, DnsQueryCaptureConsumer, EventConsumer, Probe};
@@ -262,13 +262,34 @@ impl Daemon {
         let dns_query_consumer = DnsQueryCaptureConsumer::spawn(dns_query_ring, crate::dns::query_capture_callback(Arc::clone(&pending)));
         let dns_consumer = DnsCaptureConsumer::spawn(
             dns_ring,
-            dns_answer_callback(Arc::clone(&domain_cache), Arc::clone(&pending), Arc::clone(&shared_probe), Arc::clone(&name_rules), Arc::clone(&trusted_resolvers), Arc::clone(&resolver), Arc::clone(&security), tx.clone()),
+            dns_answer_callback(
+                Arc::clone(&domain_cache),
+                Arc::clone(&pending),
+                Arc::clone(&shared_probe),
+                Arc::clone(&name_rules),
+                Arc::clone(&trusted_resolvers),
+                Arc::clone(&resolver),
+                Arc::clone(&security),
+                tx.clone(),
+            ),
         );
 
         let stats_shutdown = Arc::new(AtomicBool::new(false));
-        let stats_handle = spawn_stats_thread(Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&security), tx.clone(), Arc::clone(&stats_shutdown), events_emitted, denies_since_last, config.r2, stats_interval_s);
+        let stats_handle = spawn_stats_thread(
+            Arc::clone(&shared_probe),
+            Arc::clone(&shared_state),
+            Arc::clone(&resolver),
+            Arc::clone(&security),
+            tx.clone(),
+            Arc::clone(&stats_shutdown),
+            events_emitted,
+            denies_since_last,
+            config.r2,
+            stats_interval_s,
+        );
 
-        let outcome = run_directive_loop(stdin.lock(), Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&name_rules), Arc::clone(&pending), tx.clone(), boot_offset_ns);
+        let outcome =
+            run_directive_loop(stdin.lock(), Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&name_rules), Arc::clone(&pending), tx.clone(), boot_offset_ns);
 
         // Shutdown, in dependency order. Deliberately no probe mutation
         // anywhere in this sequence -- see the module doc.

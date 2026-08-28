@@ -174,6 +174,10 @@ mod tests {
         let mut tracker = DropTracker::new();
         assert_eq!(tracker.observe(1, 100, 1, &config), EscalationDecision::Escalate(EscalationAction::Lockdown));
         tracker.forget(1);
-        assert_eq!(tracker.observe(1, 100, 1, &config), EscalationDecision::Escalate(EscalationAction::Lockdown), "forgetting clears the escalated flag too, so a re-attached container can be evaluated fresh");
+        assert_eq!(
+            tracker.observe(1, 100, 1, &config),
+            EscalationDecision::Escalate(EscalationAction::Lockdown),
+            "forgetting clears the escalated flag too, so a re-attached container can be evaluated fresh"
+        );
     }
 }

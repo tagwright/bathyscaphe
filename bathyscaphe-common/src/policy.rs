@@ -321,14 +321,7 @@ impl PolicyValue {
     /// (only `cidr_default_action` applies). Use
     /// [`Self::with_port_rule`] to populate [`Self::port_rules`].
     pub const fn new(cidr_default_action: u8, source: u8, expires_at_ns: u64) -> Self {
-        Self {
-            expires_at_ns,
-            cidr_default_action,
-            source,
-            n_port_rules: 0,
-            _pad: [0; 5],
-            port_rules: [PortRule::new(0, 0, 0, 0); MAX_PORT_RULES],
-        }
+        Self { expires_at_ns, cidr_default_action, source, n_port_rules: 0, _pad: [0; 5], port_rules: [PortRule::new(0, 0, 0, 0); MAX_PORT_RULES] }
     }
 
     /// Append one port rule, returning `false` (and leaving `self`

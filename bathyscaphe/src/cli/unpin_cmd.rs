@@ -20,8 +20,8 @@ use std::process::ExitCode;
 
 use crate::probe::Probe;
 
-use super::log::Logger;
 use super::UnpinArgs;
+use super::log::Logger;
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_FATAL_ERROR: u8 = 1;
@@ -66,7 +66,10 @@ pub fn run(args: UnpinArgs, logger: &Logger) -> ExitCode {
 
     match Probe::unpin_all_at(&bpffs_root) {
         Ok(()) => {
-            logger.info("cli.unpin.cleared", &format!("cleared {} under {}: {} program(s), {} map(s), {} container link set(s)", "the pin subtree", bpffs_root.display(), before.programs, before.maps, before.containers));
+            logger.info(
+                "cli.unpin.cleared",
+                &format!("cleared {} under {}: {} program(s), {} map(s), {} container link set(s)", "the pin subtree", bpffs_root.display(), before.programs, before.maps, before.containers),
+            );
             println!("bathyscaphe unpin --all: cleared {}", bpffs_root.display());
             println!("  programs removed:        {}", before.programs);
             println!("  maps removed:             {}", before.maps);
