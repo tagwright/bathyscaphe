@@ -5,8 +5,9 @@ This is the packaging build chunk's doc: the image, the runtime posture it
 needs, a compose snippet for the privileged container, and the topology
 question that actually matters for a real deployment -- how airlock gets
 at this binary. See `docs/BUILDING.md` for how the image itself is built,
-`docs/TESTING.md` for how the runtime behavior here was proven, and the
-README for what bathyscaphe is and its fail-closed/R2 design.
+`docs/TESTING.md` for how the runtime behavior here was proven,
+`docs/RECOVERY.md` for the break-glass and full-removal operations, and
+the README for what bathyscaphe is and its fail-closed/R2 design.
 
 ## Runtime posture
 
@@ -105,31 +106,26 @@ docker run --rm --privileged \
   ghcr.io/tagwright/bathyscaphe:latest unpin --all
 ```
 
-Two gotchas worth knowing before you run `observe` against a real host:
+Two things worth knowing before you run `observe` against a real host:
 
-- **It attaches to *every* running container, immediately, with no
-  scoping flag.** `--container` only filters which events get *printed*
-  -- it does not narrow which cgroups get attached. Pointed at a
-  production host's real `/sys/fs/cgroup` with `--cgroupns=host`, this
-  attaches an observe-only (always-allow, never-blocking) eBPF hook to
-  every container running on that host, not just the one you're
-  debugging. Harmless to traffic, since observe mode always returns
-  allow regardless of what it logs, but it is still a live kernel-side
-  attachment to every one of those containers' `connect()` calls for as
-  long as `observe` is running, so prefer a scratch host, a scratch
-  cgroup subtree, or accept that scope before running it against
-  anything that matters.
-- **Clean exit is `Ctrl-C` (`SIGINT`) specifically.** `observe`'s
-  detach-and-unpin-on-exit logic is a `SIGINT` handler; nothing else
-  runs it. Killing the process any other way -- `docker stop`'s default
-  `SIGTERM`, `timeout <n> bathyscaphe observe` without `--signal=INT`,
-  an OOM kill -- skips that cleanup and leaves every container it
-  attached to still attached, pinned in bpffs, until something clears
-  them. `bathyscaphe unpin --all` is exactly that something: it's the
-  break-glass for precisely this situation, not just for a dead `run`
-  daemon. If you kill `observe` the wrong way, run `unpin --all`
-  immediately after, and don't assume "the process exited" means "the
-  hooks are gone."
+- **With no `--container`, it attaches to *every* running container,
+  immediately.** This is the intended default -- "observe the whole
+  host" -- and it's harmless to traffic either way, since observe mode
+  always returns allow regardless of what it logs. But it is still a
+  live kernel-side attachment to every one of those containers'
+  `connect()` calls for as long as `observe` is running, so on a
+  production host, scope it with `--container <id-or-name>` unless you
+  actually mean to watch everything. `--container` genuinely narrows
+  which cgroups get an eBPF hook attached at all, not just which events
+  get printed -- the same predicate gates both.
+- **Clean exit is `Ctrl-C` (`SIGINT`), `docker stop`'s default `SIGTERM`,
+  or `SIGHUP`** -- all three run the identical detach-and-unpin-on-exit
+  path. An OOM kill (`SIGKILL`, which can't be caught by any process)
+  still skips it and leaves whatever `observe` attached pinned in bpffs
+  until something clears it; `bathyscaphe unpin --all` is that
+  something (see docs/RECOVERY.md). If `observe` ever goes away via
+  `SIGKILL` or a hard crash, run `unpin --all` afterward and don't
+  assume "the process exited" means "the hooks are gone."
 
 ## Airlock integration topology
 

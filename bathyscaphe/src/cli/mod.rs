@@ -160,8 +160,15 @@ pub struct ObserveArgs {
     #[arg(long, value_enum, default_value_t = ObserveFormat::Json)]
     pub format: ObserveFormat,
 
-    /// Only print events for this container (matched against the full
-    /// container id, an id prefix, or the container's name).
+    /// Scope this session to a single container, matched against the full
+    /// container id, an id prefix, or the container's exact name. With
+    /// this set, `observe` attaches its eBPF hooks ONLY to the matching
+    /// container (and, on the poll loop, to a later-started container
+    /// that matches) -- it never attaches to every other container on the
+    /// host. Events are naturally printed only for whatever this session
+    /// attached, so this one flag scopes both what is hooked and what is
+    /// shown. Omit it to keep the default: attach to (and print for)
+    /// every running container, observing the whole host.
     #[arg(long)]
     pub container: Option<String>,
 }

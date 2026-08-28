@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `bathyscaphe observe`: a standalone, observe-only mode for manual
 //! verification and debugging. No airlock, no NDJSON handshake, no
-//! enforcement -- it loads the probe, attaches to whatever containers are
-//! running (and watches for new ones), and prints egress events straight
-//! to stdout for a human (or a quick pipe into `jq`) to look at.
+//! enforcement -- it loads the probe, attaches to every running container
+//! (or, when `--container <id-or-name>` is given, ONLY the matching
+//! container(s) -- see [`ObserveArgs::container`] and
+//! [`attach_new_containers`]: the same predicate that scopes which
+//! containers get a real kernel attach also scopes what gets printed, so
+//! the two can never drift apart), watches for new ones on the same
+//! filter, and prints egress events straight to stdout for a human (or a
+//! quick pipe into `jq`) to look at.
 //!
 //! ## How this differs from `run`
 //!
@@ -18,10 +23,13 @@
 //! - If `--bpffs-root` was empty when this process started (the common
 //!   case: no `run` daemon is active), this process's own
 //!   [`crate::probe::Probe::load_or_reopen`] call is what freshly loads
-//!   and pins the programs/maps. On a clean Ctrl-C, every container this
-//!   session itself attached is detached, and the whole pin subtree this
-//!   session created is removed (`Probe::unpin_all`) -- the host is left
-//!   exactly as it was found.
+//!   and pins the programs/maps. On a clean exit -- `SIGINT` (Ctrl-C),
+//!   `SIGTERM` (`docker stop`, `timeout`), or `SIGHUP` -- every container
+//!   this session itself attached is detached, and the whole pin subtree
+//!   this session created is removed (`Probe::unpin_all`) -- the host is
+//!   left exactly as it was found. See [`install_stop_signal_handlers`]
+//!   for why all three signals run the identical cleanup path, and why
+//!   `run`'s daemon deliberately does not.
 //! - If `--bpffs-root` was ALREADY populated (most plausibly a `run`
 //!   daemon is actively enforcing there), this process reopens the
 //!   existing pins rather than reloading, attaches only to containers
@@ -60,7 +68,7 @@ use crate::probe::{DnsCaptureConsumer, DnsQueryCaptureConsumer, EventConsumer, P
 use super::log::Logger;
 use super::{ObserveArgs, ObserveFormat};
 
-/// Set by the `SIGINT` handler below; polled by the main loop. A plain
+/// Set by the signal handler below; polled by the main loop. A plain
 /// `AtomicBool` (not a channel) because the only thing that needs to
 /// observe it is this same process's main thread, on a short poll
 /// interval -- exactly the same shape `probe::events`/`attribution::cgroup`
@@ -71,26 +79,53 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// # Safety / signal-safety
 /// The only thing this does is an atomic store, which is async-signal-safe
 /// (no allocation, no locking, no syscalls beyond the store itself).
-extern "C" fn handle_sigint(_signum: libc::c_int) {
+extern "C" fn handle_stop_signal(_signum: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
+}
+
+/// Installs `handle_stop_signal` for every signal that should trigger
+/// `observe`'s ephemeral cleanup path: `SIGINT` (Ctrl-C at an interactive
+/// terminal), and `SIGTERM`/`SIGHUP` (a supervised stop -- `docker stop`
+/// sends `SIGTERM`, as does `timeout`; a hung-up controlling terminal or
+/// `systemctl stop` can send either). Before this fix, `SIGTERM` and
+/// `SIGHUP` fell through to their default disposition (immediate process
+/// termination) and skipped the detach/unpin path entirely, leaving this
+/// session's eBPF links and pin subtree attached with nothing left to
+/// clean them up.
+///
+/// This is deliberately the SAME cleanup path for all three signals, and
+/// deliberately NOT the posture `run` uses: `observe` is ephemeral (see
+/// this module's top doc) and is supposed to leave the host exactly as it
+/// found it, so every stop signal here means "detach/unpin and exit
+/// clean." `run`'s daemon loop (`daemon::Daemon::run`,
+/// `cli::run_cmd::run`) is fail-closed-PERSISTENT by design and does not
+/// install any of these handlers at all -- an operator or supervisor
+/// killing `run` is exactly the case fail-closed pinning exists for, so
+/// its pins and links must stay in the kernel across a `SIGTERM`/`SIGKILL`/
+/// crash, never get torn down on exit. Do not port this function's
+/// handlers onto `run`.
+fn install_stop_signal_handlers() {
+    // SAFETY: `handle_stop_signal` only performs an atomic store, which is
+    // async-signal-safe; installing it is safe for the lifetime of this
+    // process.
+    unsafe {
+        libc::signal(libc::SIGINT, handle_stop_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, handle_stop_signal as *const () as usize);
+        libc::signal(libc::SIGHUP, handle_stop_signal as *const () as usize);
+    }
 }
 
 /// How often the main loop re-checks for newly-started containers to
 /// attach to, and re-checks the shutdown flag. Matches the cadence
 /// convention the rest of this crate's background loops use (see
-/// `probe::events::POLL_TIMEOUT_MS`'s doc): bounds Ctrl-C latency without
+/// `probe::events::POLL_TIMEOUT_MS`'s doc): bounds stop-signal latency without
 /// mattering for event latency, since events flow through the ring buffer
 /// consumer thread, not this loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
     STOP.store(false, Ordering::SeqCst);
-    // SAFETY: `handle_sigint` only performs an atomic store, which is
-    // async-signal-safe; installing it is safe for the lifetime of this
-    // process.
-    unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
-    }
+    install_stop_signal_handlers();
 
     let bpffs_root = args.bpffs_root.clone().unwrap_or_else(|| PathBuf::from(crate::probe::DEFAULT_BPFFS_ROOT));
     let cgroup_root = args.cgroup_root.clone().unwrap_or_else(|| PathBuf::from(crate::attribution::cgroup::DEFAULT_CGROUP_ROOT));
@@ -188,7 +223,7 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
     let dns_query_consumer = DnsQueryCaptureConsumer::spawn(dns_query_ring, crate::dns::query_capture_callback(Arc::clone(&pending)));
     let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache), Arc::clone(&pending), trusted_resolvers, |_answer| {}));
 
-    logger.info("cli.observe.watching", "watching for egress events; Ctrl-C to detach and exit");
+    logger.info("cli.observe.watching", "watching for egress events; Ctrl-C, SIGTERM, or SIGHUP to detach and exit");
     while !STOP.load(Ordering::SeqCst) {
         {
             let mut probe_guard = shared_probe.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -197,7 +232,7 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    logger.info("cli.observe.stopping", "Ctrl-C received; detaching this session's containers and exiting");
+    logger.info("cli.observe.stopping", "stop signal received; detaching this session's containers and exiting");
     consumer.stop();
     dns_consumer.stop();
     dns_query_consumer.stop();
@@ -328,6 +363,27 @@ mod tests {
             rule_id: None,
             domain: Domain::unresolved(),
             meta: bathyscaphe_proto::EventMeta { dropped_since_last: 0 },
+        }
+    }
+
+    #[test]
+    fn sigint_sigterm_and_sighup_all_set_the_same_stop_flag() {
+        // One test, not three: `STOP` is a single process-wide static, and
+        // `install_stop_signal_handlers`/`libc::raise` touch real process
+        // signal disposition, so driving all three signals sequentially
+        // inside one test avoids the interleaving a parallel `cargo test`
+        // run could otherwise introduce between separate test functions.
+        //
+        // This is the regression test for the SIGTERM/SIGHUP cleanup fix:
+        // before it, only `SIGINT` was installed, so a `docker stop`
+        // (SIGTERM) or a hung-up controlling terminal (SIGHUP) fell
+        // through to the default disposition (immediate termination) and
+        // never reached `observe`'s detach/unpin path at all.
+        install_stop_signal_handlers();
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            STOP.store(false, Ordering::SeqCst);
+            unsafe { libc::raise(signal) };
+            assert!(STOP.load(Ordering::SeqCst), "signal {signal} must set the shared stop flag that drives observe's cleanup-on-exit path");
         }
     }
 
