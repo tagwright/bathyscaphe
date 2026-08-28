@@ -2,8 +2,9 @@
 # DNS observation and FQDN enforcement
 
 Build chunks #9 (DNS observation), #10 (query/response correlation + FQDN
-enforcement), and #11 (trusted-resolver enforcement + name-based deny) of
-the sequence in `bathy_build_spec.md`. This document is the honest account
+enforcement), #11 (trusted-resolver enforcement + name-based deny), and
+#12 (exact-length capture correctness fix) of the sequence in
+`bathy_build_spec.md`. This document is the honest account
 of what bathyscaphe's DNS layer sees, what it structurally cannot see, and
 how the pieces fit together. IP/CIDR policy remains the ground truth
 throughout (`bathy_build_spec.md`'s BUILD-THROUGH STANCE); FQDN enforcement
@@ -20,10 +21,18 @@ monitored container's cgroup (`bathyscaphe-ebpf::dns`). It recognizes a
 UDP datagram whose *source* port is 53 (a DNS response arriving at the
 container from its resolver, whether that resolver is an external server
 or Docker's embedded resolver at `127.0.0.11:53` reached over loopback)
-and copies up to `bathyscaphe_common::dns::DNS_CAPTURE_MAX` (512) bytes of
-its payload, plus the observing cgroup id, a kernel timestamp, and (as of
-build chunk #11) the packet's own IP-layer SOURCE address, into a
-dedicated `DNS_EVENTS` ring buffer. That source address
+and copies its EXACT payload length, up to
+`bathyscaphe_common::dns::DNS_CAPTURE_MAX` (512) bytes, plus the observing
+cgroup id, a kernel timestamp, and (as of build chunk #11) the packet's
+own IP-layer SOURCE address, into a dedicated `DNS_EVENTS` ring buffer.
+**As of build chunk #12**, this is a single, exact-length
+`bpf_skb_load_bytes` call (a verifier-safe clamp-then-mask idiom -- see
+"Build chunk #12" below) -- chunks #9-#11 instead used a ladder of six
+literal-size tiers (512/384/256/128/64/32 bytes, largest-that-fits), which
+silently TRUNCATED any response whose true length fell strictly between
+two adjacent tiers to the smaller one, corrupting the message. That bug is
+fixed; every response up to the cap is now captured at its own true
+length, with no tier-granularity loss. That source address
 (`bathyscaphe_common::dns::DnsCapture::src_addr`, IPv4-mapped-into-IPv6 per
 RFC 4291, the same embedding `Event::src_addr`/`PolicyKeyData::addr` use)
 is what chunk #11's trusted-resolver check (below) is built on -- unlike
@@ -77,11 +86,22 @@ container's actual connectivity.
   recognized. DNS traffic essentially never uses IPv6 extension headers in
   practice.
 - **Oversized responses**: a UDP DNS payload longer than
-  `DNS_CAPTURE_MAX` (512 bytes) is captured truncated, not rejected.
-  `bathyscaphe::dns::parse::parse_dns_response` handles a message that
-  fails to parse as a result the same way it handles any other malformed
-  input: as "nothing learned from this datagram," never a panic or a
-  process-level error.
+  `DNS_CAPTURE_MAX` (512 bytes) is captured truncated EXACTLY at the cap
+  (as of build chunk #12 -- see below for the pre-#12 tier-truncation
+  behavior this replaced), not rejected. A message truncated this way
+  fails `simple-dns`'s own `Packet::parse` outright (verified
+  experimentally: it rejects the whole message the instant its header's
+  claimed answer count exceeds what the truncated bytes actually
+  contain, even when several complete answers sit intact earlier in the
+  buffer) -- `bathyscaphe::dns::parse::parse_dns_response` now retries
+  with a tolerant fallback (`recover_capped_answers`) that walks the
+  claimed answer count down until a smaller value's worth of records
+  actually fits, recovering the largest prefix of COMPLETE answers the
+  truncated capture contains, rather than discarding the whole message.
+  A message truncated before even its first answer completes (or one
+  that fails for a genuinely unrelated reason) still yields nothing, the
+  same "nothing learned from this datagram" outcome as any other
+  malformed input, never a panic or a process-level error.
 - **Injected/synthesized DNS replies can attribute to the wrong cgroup**:
   `dns_snoop`'s cgroup attribution comes from `bpf_get_current_cgroup_id()`
   at the moment the kernel evaluates the ingress hook -- the cgroup of
@@ -654,7 +674,187 @@ best-effort narrowing on top of that floor, exactly like a name-based
 allow is a best-effort widening on top of it -- never a substitute for
 either.
 
-## Full residual limitation list (chunks #9-#11, honest and complete)
+## Build chunk #12: exact-length capture correctness fix
+
+### The bug, as observed live
+
+Chunks #9-#11's `dns_snoop` captured a DNS response payload by trying a
+ladder of six LITERAL, compile-time-constant `bpf_skb_load_bytes` lengths
+(512, 384, 256, 128, 64, 32 bytes -- the `try_tier!` macro,
+`bathyscaphe-ebpf::dns`), largest-first, keeping whichever succeeded. This
+was itself a fix for a real eBPF verifier limitation (a COMPUTED length
+argument's tracked range could never be proven to exclude zero on this
+workspace's toolchain and kernel -- `docs/TESTING.md`'s chunk #9 account
+has the full investigation), but it traded that problem for a different
+one: a response whose TRUE length fell strictly BETWEEN two adjacent
+tiers was captured at the NEXT SMALLER tier, silently truncating it. This
+was observed live, not merely reasoned about: a genuine ~90-100-byte DNS
+response landed between the 64- and 128-byte tiers and was captured at
+only 64 bytes. A truncated DNS message fails to parse in userspace
+(`simple-dns`'s `Packet::parse` rejects it outright), so that answer never
+reached the domain cache or the FQDN allow-map at all -- the practical
+consequence was FQDN enforcement intermittently over-blocking legitimate
+name-allowed traffic (fail-closed, per this project's own posture, but
+WRONG: the name genuinely had been resolved, the capture just lost the
+evidence).
+
+### The fix: clamp-then-mask, not tiers
+
+`bathyscaphe-ebpf::dns::capture_if_dns_response` now issues a SINGLE
+`bpf_skb_load_bytes` call whose length is the UDP header's own honest
+length, clamped to `DNS_CAPTURE_MAX`, computed via a two-step idiom that
+proves the verifier's required "nonzero length" bound WITHOUT depending on
+any branch's narrowing surviving the compiler's BPF-target codegen (the
+specific failure chunk #9 hit for a runtime-subtraction-derived length):
+
+1. **Clamp**: an ordinary `if`/`else` `min` against the compile-time
+   `DNS_CAPTURE_MAX` constant -- no subtraction against any
+   skb-context-derived value at all (unlike the earlier, rejected
+   `skb_len - offset` attempts).
+2. **Mask, then add one**: `((capped - 1) & (DNS_CAPTURE_MAX - 1)) + 1`.
+   The eBPF verifier derives a bitwise AND's output range directly from
+   the mask operand, independent of the input's own prior tracked range,
+   and an addition of a compile-time positive constant has a provably
+   positive minimum -- together these prove the final value is in
+   `[1, DNS_CAPTURE_MAX]` from the AND/ADD instructions themselves. Given
+   the clamp step's actual runtime range (`capped` is always in
+   `[1, DNS_CAPTURE_MAX]` once a zero-length payload is special-cased away
+   before this code runs), the mask-then-add is a value-preserving
+   IDENTITY -- the final length always equals the clamped length exactly,
+   so nothing is lost to the trick itself. See
+   `bathyscaphe-ebpf::dns`'s own module doc for the full derivation.
+
+This was VERIFIED LIVE against a real kernel 6.8.0-136: `attach_container`
+succeeds for all seven programs (the verifier accepts the new capture
+code), and real responses of varying sizes -- including ones deliberately
+sized into the OLD tier gaps -- are now captured at their own exact
+length. See "Privileged smoke test" below for the precise sizes.
+
+### The cap: unchanged at 512 bytes, over-cap behavior documented
+
+`DNS_CAPTURE_MAX` stays 512 bytes (the historical "traditional" UDP DNS
+ceiling before EDNS0) rather than raising it toward a modern EDNS0 value
+(commonly 1232, per RFC 8467's fragmentation-avoidance recommendation, or
+up to 4096) -- the bug this chunk fixes was tier GRANULARITY, not the cap
+itself, and 512 bytes comfortably covers the overwhelming majority of a
+container's real A/AAAA lookups against a typical resolver. A response
+that genuinely exceeds 512 bytes is still captured, truncated EXACTLY at
+the cap (not tier-truncated below it) -- see "The tolerant path" in
+`bathyscaphe::dns::parse`'s module doc, and "Oversized responses" above,
+for how the userspace parser now recovers whatever complete answers fit
+within that cap-truncated prefix rather than discarding the whole message
+the way it did pre-chunk-#12.
+
+### The userspace parser: a new tolerant path, verified against simple-dns
+
+Verified experimentally (not assumed) against `simple-dns` 0.12: given a
+buffer truncated mid-record, `Packet::parse` fails the WHOLE message with
+`SimpleDnsError::InsufficientData`, discarding even fully-intact earlier
+answers, because its per-section parse loop trusts the header's own
+`ANCOUNT` field and always tries to parse that many records regardless of
+how many the truncated bytes can actually supply. `simple-dns`'s public
+API exposes no lower-level per-record parse loop to resume manually (its
+`Header`, `BytesBuffer`, and internal `WireFormat` trait are all private
+to that crate), so `bathyscaphe::dns::parse::recover_capped_answers`
+instead retries `Packet::parse` on a byte-for-byte copy with the header's
+`ANCOUNT` (and `NSCOUNT`/`ARCOUNT`, zeroed) patched down from its original
+claimed value -- three well-known, fixed-offset RFC 1035 section 4.1.1
+count fields, never a name or a record body -- until one candidate value
+actually fits. This recovers the largest prefix of COMPLETE answer
+records a capped/truncated capture contains; every byte of actual parsing
+(name decompression, rdata validation) is still done entirely by
+`simple-dns` itself. See `bathyscaphe::dns::parse`'s module doc for the
+full design and `bathyscaphe/src/dns/parse.rs`'s test module for the
+regression coverage (a response truncated mid-record recovers exactly the
+answers ahead of the cut; one truncated before any answer completes
+recovers nothing, not a panic).
+
+### Privileged smoke test -- FULL PROOF, precisely
+
+**Setup**: this test deliberately does NOT go through a Docker container
+or real internet DNS traffic (chunks #9-#11's own tests already prove
+`dns_snoop` against genuine resolver traffic; EXACT byte-length control
+across several sizes is the whole point here, which no real resolver's
+answer size can be precisely dialed to). Instead, the test process itself
+was moved into a fresh, dedicated cgroup v2 directory (the same
+mkdir-and-attach pattern `probe::live_smoke` uses), the real probe (all
+seven programs, `dns_snoop` included) attached to it, and two loopback UDP
+sockets (one bound to port 53 standing in for "the resolver," one on an
+ephemeral port standing in for "the container's own query socket")
+exchanged real, hand-built DNS response payloads of chosen sizes over a
+real kernel socket path -- still the REAL `dns_snoop` `cgroup_skb` ingress
+hook on a REAL `sk_buff` for each size, just with the size fully under the
+test's control. Run on the same host, kernel 6.8.0-136,
+`bathyscaphe-itest-dnsfix-priv` (`--privileged --cgroupns=host --pid=host`).
+
+**What ran**:
+`probe::dns::live_smoke::dns_snoop_captures_the_exact_length_across_varying_sizes_including_the_old_tier_gap`.
+
+**Result, exactly as printed by the passing run**:
+
+```
+dns live_smoke (varying sizes): baseline: sent 46 bytes, captured 46 bytes, parsed 1 answer(s)
+dns live_smoke (varying sizes): tier_gap: sent 74 bytes, captured 74 bytes, parsed 1 answer(s)
+dns live_smoke (varying sizes): mid_gap: sent 467 bytes, captured 467 bytes, parsed 14 answer(s)
+dns live_smoke (varying sizes): over_cap: sent 653 bytes, captured 512 bytes, parsed 15 answer(s)
+dns live_smoke (varying sizes): FULL PROOF -- clamp-then-mask exact-length capture verified live across 4 sizes, including the old 64/128 and 384/512 tier gaps and one over-cap case
+```
+
+This decisively proves, on a real kernel, for a real `sk_buff` at each
+size:
+
+- **46 bytes** (`baseline`, sitting cleanly WITHIN the old 32/64-byte
+  tier): captured at its own exact length -- a sanity check that the fix
+  doesn't regress the case the old scheme already handled correctly.
+- **74 bytes** (`tier_gap`, deliberately sized strictly between the OLD
+  64- and 128-byte tiers -- the exact shape of the LIVE bug this chunk
+  fixes): captured at its own exact length, 74 bytes, and parses
+  completely. Pre-chunk-#12, this size would have been truncated to 64
+  bytes and failed to parse at all.
+- **467 bytes** (`mid_gap`, strictly between the OLD 384- and 512-byte
+  tiers, with 14 answer records): captured at its own exact length and
+  every one of the 14 answers parses.
+- **653 bytes** (`over_cap`, deliberately exceeding `DNS_CAPTURE_MAX`,
+  20 answer records): captured truncated EXACTLY at the 512-byte cap (not
+  tier-truncated below it), and the tolerant parser recovers 15 of the 20
+  answers -- precisely the number whose complete records fit within the
+  512-byte prefix, proving the "recover what's actually there, don't
+  fabricate what isn't" behavior end to end.
+
+Re-run alongside all four pre-existing privileged live-smoke tests
+(`probe::live_smoke::load_attach_pin_reopen_unpin_round_trip`,
+`probe::dns::live_smoke::dns_snoop_captures_and_parses_a_real_containers_dns_answer`,
+`probe::dns::live_smoke::dns_snoop_captures_the_responses_own_source_address`,
+`probe::dns_query::live_smoke::query_response_correlation_recovers_the_correct_container_cgroup`,
+`attribution::resolver::live_smoke::resolves_a_real_container_end_to_end`)
+in one invocation: all six passed together. Notably, chunk #9's own
+`dns_snoop_captures_and_parses_a_real_containers_dns_answer` test --
+against genuine `nslookup example.com` traffic on this same run --
+reported an 85-byte capture (its own historical account in
+`docs/TESTING.md` recorded 64-byte tier-truncated captures for this exact
+scenario); the exact-length fix improved a real, non-synthetic capture in
+the same test run this chunk's own synthetic test was verifying.
+
+**Cleanup**: the test's own cgroup directory and bpffs pin root were
+removed as part of its own teardown (this process is moved back to its
+original cgroup first, since a cgroup directory cannot be removed while a
+process still lists it as its own). `bathyscaphe-itest-dnsfix-build` and
+`bathyscaphe-itest-dnsfix-priv` were removed after use; confirmed via
+`docker ps -a` afterward. `/sys/fs/bpf` confirmed empty and no leftover
+`bathyscaphe-itest-*` cgroup directories confirmed via
+`find /sys/fs/cgroup -maxdepth 1 -iname 'bathyscaphe*'` after the final run.
+
+### Egress query capture: unaffected, confirmed minimal
+
+`bathyscaphe-ebpf::dns_query` (`dns_query_snoop`) never had this problem
+and needed no change: every read it performs is a small, fixed-size load
+at a fixed offset (IP header fields, both UDP ports, the two-byte DNS
+transaction id) -- it never copies a variable-length payload at all, so
+none of chunk #9's tiered-length machinery (or this chunk's replacement)
+ever applied to it. Confirmed unchanged in this chunk;
+`bathyscaphe-ebpf/src/dns_query.rs` was not touched.
+
+## Full residual limitation list (chunks #9-#12, honest and complete)
 
 IP/CIDR policy is the ground-truth floor throughout; every limitation
 below describes when FQDN enforcement's best-effort layer has nothing to

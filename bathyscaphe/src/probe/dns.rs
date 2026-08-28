@@ -533,6 +533,183 @@ mod live_smoke {
             );
         }
     }
+
+    /// Build chunk #12's own privileged proof point: does the clamp-then-
+    /// mask exact-length capture (this module's own doc has the full
+    /// verifier-safety derivation) actually replace build chunk #9's
+    /// tiered capture on a real kernel, for VARYING real payload sizes --
+    /// specifically including a size that landed strictly between two of
+    /// the OLD literal tiers (64/128 and 384/512), which the old scheme
+    /// would have silently truncated to the smaller tier.
+    ///
+    /// Deliberately does NOT go through a Docker container or real
+    /// internet DNS traffic (chunk #9/#10/#11's own tests already prove
+    /// `dns_snoop` against genuine resolver traffic; this test's whole
+    /// point is EXACT byte-length control across several sizes, which no
+    /// real resolver's answer size is precisely controllable). Instead:
+    /// this test process itself is moved into a fresh, dedicated cgroup v2
+    /// directory (mirroring `probe::live_smoke`'s own cgroup-creation
+    /// pattern), the real probe (all seven programs, `dns_snoop` included)
+    /// is attached to it, and two loopback UDP sockets -- one bound to
+    /// port 53 standing in for "the resolver," one bound to an ephemeral
+    /// port standing in for "the container's own query socket" -- exchange
+    /// real, hand-built DNS response payloads of chosen sizes over a real
+    /// kernel socket path. This still exercises the REAL `dns_snoop`
+    /// `cgroup_skb` ingress hook on a REAL `sk_buff` for each size (the
+    /// same `bpf_skb_load_bytes` call path a genuine external resolver's
+    /// reply would take), it just removes every source of size
+    /// non-determinism a real resolver or a real container network would
+    /// introduce.
+    #[test]
+    #[ignore = "requires root, --privileged, a real cgroup2 host, and a writable bpffs -- see docs/TESTING.md"]
+    fn dns_snoop_captures_the_exact_length_across_varying_sizes_including_the_old_tier_gap() {
+        use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+        use bathyscaphe_common::DNS_CAPTURE_MAX;
+
+        use crate::dns::parse_dns_response;
+
+        if !running_as_root() {
+            eprintln!("dns live_smoke (varying sizes): skipping, not running as root");
+            return;
+        }
+
+        const CGROUP_PATH: &str = "/sys/fs/cgroup/bathyscaphe-dnsfix-smoke-test";
+        const BPFFS_ROOT_SIZES: &str = "/sys/fs/bpf/bathyscaphe-dns-sizes-smoke-test";
+
+        /// Hand-builds a real DNS A-response wire message with `n` answers
+        /// for `name`, using `simple_dns` directly (already a `bathyscaphe`
+        /// dependency) -- the same construction
+        /// `dns::mod::tests::build_a_response` and `dns::parse::tests::packet_bytes`
+        /// use, inlined here since this test lives in a different module.
+        fn build_response(txid: u16, name: &str, n: u8) -> Vec<u8> {
+            let mut packet = simple_dns::Packet::new_reply(txid);
+            packet.set_flags(simple_dns::PacketFlag::RESPONSE);
+            packet.questions.push(simple_dns::Question::new(simple_dns::Name::new_unchecked(name).into_owned(), simple_dns::TYPE::A.into(), simple_dns::CLASS::IN.into(), false));
+            for i in 1..=n {
+                packet.answers.push(simple_dns::ResourceRecord::new(simple_dns::Name::new_unchecked(name), simple_dns::CLASS::IN, 60, simple_dns::rdata::RData::A(simple_dns::rdata::A { address: Ipv4Addr::new(10, 0, 0, i).into() })));
+            }
+            packet.build_bytes_vec().expect("test packet should always serialize")
+        }
+
+        // Reads this process's own current cgroup v2 path (the single
+        // `0::<path>` line in `/proc/self/cgroup` on a pure-cgroup-v2 host,
+        // which this codebase already requires -- `bathy_build_spec.md`'s
+        // "KERNEL FLOOR" section) so it can be restored at teardown; a
+        // cgroup directory cannot be removed while a process still lists
+        // it as its cgroup.
+        fn own_cgroup_path() -> String {
+            let contents = std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup");
+            let line = contents.lines().find(|l| l.starts_with("0::")).expect("a cgroup v2 host has exactly one 0:: line");
+            format!("{DEFAULT_CGROUP_ROOT}{}", &line[3..])
+        }
+
+        fn move_self_into(cgroup_path: &str) {
+            std::fs::write(format!("{cgroup_path}/cgroup.procs"), std::process::id().to_string()).unwrap_or_else(|e| panic!("failed to move this process into {cgroup_path}: {e}"));
+        }
+
+        let original_cgroup = own_cgroup_path();
+        std::fs::create_dir_all(CGROUP_PATH).expect("create the test cgroup v2 directory");
+        move_self_into(CGROUP_PATH);
+
+        let bpffs_root = PathBuf::from(BPFFS_ROOT_SIZES);
+        let _ = Probe::unpin_all_at(&bpffs_root);
+        let mut probe = Probe::load_or_reopen(crate::EBPF_OBJECT, bpffs_root.clone()).expect("fresh load_or_reopen should load, pin, and reopen cleanly -- a verifier rejection of the clamp-then-mask capture would surface here");
+
+        let outcome: Result<Vec<(String, usize, usize, usize)>, String> = (|| {
+            probe.attach_container(Path::new(CGROUP_PATH)).map_err(|e| format!("attach_container failed: {e:#}"))?;
+            let mut ring = probe.take_dns_events().ok_or("DNS ring buffer already taken")?;
+
+            let resolver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)).map_err(|e| format!("failed to bind the fake resolver socket to 127.0.0.1:53 (needs root): {e}"))?;
+            let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
+            receiver.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let receiver_addr = receiver.local_addr().map_err(|e| e.to_string())?;
+
+            // (label, txid, name, answer count) -- `tier_gap` and
+            // `mid_gap` are sized (by construction, verified in
+            // `dns::parse`'s own unit tests) to land strictly inside two
+            // of build chunk #9's old literal-tier gaps (64/128 and
+            // 384/512 respectively); `over_cap` deliberately exceeds
+            // `DNS_CAPTURE_MAX` to exercise the cap-truncation path too.
+            let cases: [(&str, u16, &str, u8); 4] = [("baseline", 0xAAAA, "ex.com.", 1), ("tier_gap", 0xBBBB, "tier-gap.example.com.", 1), ("mid_gap", 0xCCCC, "mid.example.com.", 14), ("over_cap", 0xDDDD, "mid.example.com.", 20)];
+
+            let mut results = Vec::new();
+            for (label, txid, name, n) in cases {
+                let payload = build_response(txid, name, n);
+                resolver.send_to(&payload, receiver_addr).map_err(|e| format!("{label}: send failed: {e}"))?;
+                let mut recv_buf = [0u8; 2048];
+                let _ = receiver.recv(&mut recv_buf); // drain so the socket queue doesn't back up; delivery (and dns_snoop's capture) already happened at send time
+
+                let expected_len = payload.len().min(DNS_CAPTURE_MAX);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut found: Option<DnsCapture> = None;
+                while Instant::now() < deadline && found.is_none() {
+                    while let Some(item) = ring.next() {
+                        if item.len() != DnsCapture::WIRE_SIZE {
+                            continue;
+                        }
+                        // SAFETY: length just checked; matches
+                        // `probe::dns::decode_capture`'s own reasoning.
+                        let capture = unsafe { std::ptr::read_unaligned(item.as_ptr().cast::<DnsCapture>()) };
+                        // Disambiguate by transaction id (the first two
+                        // captured bytes) in case of stray unrelated
+                        // traffic in this freshly-created cgroup.
+                        if capture.len as usize >= 2 && capture.captured()[0..2] == txid.to_be_bytes() {
+                            found = Some(capture);
+                            break;
+                        }
+                    }
+                    if found.is_none() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                let capture = found.ok_or_else(|| format!("{label}: dns_snoop never captured this payload (txid {txid:#06x}) within the deadline"))?;
+
+                if capture.len as usize != expected_len {
+                    return Err(format!("{label}: expected len {expected_len} (payload {} bytes, cap {DNS_CAPTURE_MAX}), got {}", payload.len(), capture.len));
+                }
+                if capture.captured() != &payload[..expected_len] {
+                    return Err(format!("{label}: captured bytes do not match the sent payload's first {expected_len} bytes -- a real content mismatch, not just a length one"));
+                }
+
+                let parsed_answers = parse_dns_response(capture.captured()).map(|p| p.answers.len()).unwrap_or(0);
+                results.push((label.to_string(), payload.len(), capture.len as usize, parsed_answers));
+            }
+            Ok(results)
+        })();
+
+        let _ = probe.unpin_all();
+        move_self_into(&original_cgroup);
+        let _ = std::fs::remove_dir(CGROUP_PATH);
+
+        let results = outcome.expect("attach_container must succeed and every case's exact length/content must be captured -- see docs/TESTING.md");
+        for (label, sent_len, captured_len, parsed_answers) in &results {
+            eprintln!("dns live_smoke (varying sizes): {label}: sent {sent_len} bytes, captured {captured_len} bytes, parsed {parsed_answers} answer(s)");
+        }
+
+        let by_label = |l: &str| results.iter().find(|(label, ..)| label == l).unwrap();
+        let (_, baseline_sent, baseline_captured, baseline_answers) = by_label("baseline");
+        assert!(*baseline_sent > 32 && *baseline_sent < 64, "sanity: this case should sit cleanly WITHIN an old tier (32/64), contrasting with the gap cases below");
+        assert_eq!(baseline_sent, baseline_captured, "a within-a-valid-old-tier response must be captured at its own exact length too");
+        assert_eq!(*baseline_answers, 1);
+
+        let (_, tier_gap_sent, tier_gap_captured, tier_gap_answers) = by_label("tier_gap");
+        assert!(*tier_gap_sent > 64 && *tier_gap_sent < 128, "sanity: this case must actually be sized into the old 64/128 tier gap");
+        assert_eq!(tier_gap_sent, tier_gap_captured, "THE regression this build chunk fixes: a response sized strictly between two old literal tiers must now be captured at its OWN exact length, not truncated to the smaller tier");
+        assert_eq!(*tier_gap_answers, 1, "and it must therefore parse completely");
+
+        let (_, mid_gap_sent, mid_gap_captured, mid_gap_answers) = by_label("mid_gap");
+        assert!(*mid_gap_sent > 384 && *mid_gap_sent < 512, "sanity: this case must actually be sized into the old 384/512 tier gap");
+        assert_eq!(mid_gap_sent, mid_gap_captured);
+        assert_eq!(*mid_gap_answers, 14);
+
+        let (_, over_cap_sent, over_cap_captured, over_cap_answers) = by_label("over_cap");
+        assert!(*over_cap_sent > DNS_CAPTURE_MAX, "sanity: this case must actually exceed the capture cap");
+        assert_eq!(*over_cap_captured, DNS_CAPTURE_MAX, "an over-cap response must be captured up to exactly the cap, not tier-truncated below it");
+        assert!(*over_cap_answers > 0 && *over_cap_answers < 20, "the tolerant parser must recover the complete answers that fit within the cap-truncated bytes, but not fabricate the ones that don't");
+
+        eprintln!("dns live_smoke (varying sizes): FULL PROOF -- clamp-then-mask exact-length capture verified live across {} sizes, including the old 64/128 and 384/512 tier gaps and one over-cap case", results.len());
+    }
 }
 
 #[cfg(test)]

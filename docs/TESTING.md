@@ -817,3 +817,133 @@ what remains unproven live is only the plumbing from "a container's actual
 DNS traffic" through to "the daemon's directive loop sees it," which
 chunk #10's own query/response correlation live-smoke test already proves
 for the trusted case.
+
+## What chunk #12 (DNS capture correctness fix) proved
+
+Fixes the truncation bug chunk #9's own tiered `bpf_skb_load_bytes`
+capture carried from the start (documented plainly at the time, in this
+file's own chunk #9 and #11 sections above): a response whose true length
+fell strictly between two adjacent literal tiers was captured at the next
+SMALLER tier, silently truncating it, which then failed to parse in
+userspace entirely. Observed live in production terms, not just in a
+test: an intermittent over-block of legitimate name-allowed traffic,
+traced back to a genuine ~90-100-byte DNS response landing between the
+64- and 128-byte tiers. Full technical account (the clamp-then-mask
+verifier-safe idiom, the cap decision, the tolerant userspace parser) is
+in `docs/DNS.md`'s "Build chunk #12" section; this section is the test
+inventory and exact tallies.
+
+### Unprivileged, no kernel/bpffs/cgroup access required
+
+`cargo test` inside the same `rust:1-bookworm` toolchain container per
+`docs/BUILDING.md`:
+
+- `dns::parse::tests` gained four new tests:
+  `a_response_between_the_old_64_and_128_byte_tiers_parses_in_full` and
+  `a_multi_answer_response_between_the_old_384_and_512_byte_tiers_parses_in_full`
+  are the userspace-level regression guards for the exact live bug (a
+  fixture deliberately sized into each old tier gap, with a self-check
+  `assert!` pinning it there, must parse completely given a FULL,
+  untruncated capture -- proving the userspace side is ready for what
+  chunk #12's eBPF fix now actually produces; the live smoke test below
+  proves the kernel side produces it).
+  `a_response_truncated_mid_record_recovers_the_complete_answers_that_fit`
+  and `a_response_truncated_before_any_complete_answer_recovers_nothing`
+  exercise the new `recover_capped_answers` tolerant path directly: a
+  3-answer response cut partway through its 3rd record recovers exactly
+  the first 2 complete answers (with a sanity assertion that `simple-dns`
+  really does reject the truncated buffer outright first, otherwise the
+  test would not be exercising the tolerant path at all); a cut before
+  even the first answer completes recovers nothing, not a panic.
+- No `bathyscaphe-common` or `bathyscaphe-proto` changes this chunk --
+  `DnsCapture`'s wire shape is unchanged (still 552 bytes; only the
+  KERNEL-side logic that decides how many of its `payload` bytes to fill
+  changed, not the struct itself), and no protocol field changed either.
+
+265 tests in the `bathyscaphe` binary crate (up from 261 pre-chunk-#12,
++4 new), 25 in `bathyscaphe-common` (unchanged), 29 in `bathyscaphe-proto`
+(unchanged), all green; 6 `#[ignore]`d (the five pre-existing live smokes
+plus this chunk's new one).
+
+### eBPF build: the verifier-safe idiom replacing the tier ladder
+
+`bathyscaphe-ebpf::dns::capture_if_dns_response` no longer contains the
+`try_tier!` macro or any literal-length ladder at all: a SINGLE
+`bpf_skb_load_bytes` call now requests a length computed as
+`((capped - 1) & (DNS_CAPTURE_MAX - 1)) + 1`, where `capped` is the UDP
+header's own honest length clamped to `DNS_CAPTURE_MAX` via a plain `if`/
+`else`. Built clean via a fresh `bathyscaphe-itest-dnsfix-build` container
+(`rust:1-bookworm`, nightly + `rust-src`, `bpf-linker` 0.11.0, identical
+toolchain steps to every prior chunk's own proof) -- `cargo build`
+succeeded with only the pre-existing harmless dead-code warnings, and
+`readelf -S` on the embedded object still shows the `cgroup/skb` section
+(the same section `dns_snoop` and `dns_query_snoop` share, per chunk
+#10's own account) present and correctly sized. Compile-time acceptance
+by `bpf-linker` is necessary but not sufficient proof the KERNEL verifier
+accepts the new length computation -- that is what the privileged smoke
+test below actually decides.
+
+### Privileged smoke test -- FULL PROOF, precisely
+
+Full account (setup, exact printed output, and what each of the four
+tested sizes decisively proves) is in `docs/DNS.md`'s "Build chunk #12"
+section, "Privileged smoke test" subsection -- reproduced here only as
+the tally this document's own convention keeps:
+
+**Setup**: `bathyscaphe-itest-dnsfix-build` (unprivileged, `rust:1-bookworm`,
+`/workspace` bind-mounted): built the workspace and the test binary.
+`bathyscaphe-itest-dnsfix-priv` (`docker run --privileged --cgroupns=host
+--pid=host`, same image, the same `/workspace` bind mount so the
+already-built test binary could run directly, `/var/run/docker.sock`
+bind-mounted, `mount -t bpf bpf /sys/fs/bpf`): host kernel 6.8.0-136.
+Deliberately does NOT go through a Docker container for the DNS traffic
+itself (see `docs/DNS.md` for why exact byte-length control ruled that
+out) -- this process was moved into a fresh cgroup v2 directory instead,
+with the real probe (all seven programs) attached to it, and two loopback
+UDP sockets exchanging hand-built DNS response payloads of chosen sizes.
+
+**What ran**:
+`probe::dns::live_smoke::dns_snoop_captures_the_exact_length_across_varying_sizes_including_the_old_tier_gap`
+(`#[ignore]`d, invoked with `--ignored --test-threads=1`).
+
+**Result**: `... ok`, with every one of four sizes captured at its exact
+expected length (46, 74, 467 bytes captured in full; a 653-byte
+over-cap case captured truncated exactly at the 512-byte cap) and parsed
+correctly (1, 1, 14, and 15 of 20 answers respectively -- the last being
+exactly how many complete records fit within the cap-truncated bytes).
+The 74-byte and 467-byte cases are the direct regression proof: both were
+deliberately sized into the OLD 64/128 and 384/512 tier gaps respectively
+(self-checked by the test's own `assert!`s), and both are now captured at
+their own exact length rather than truncated to the smaller tier.
+
+Re-run alongside all four PRE-EXISTING privileged live-smoke tests
+(`probe::live_smoke::load_attach_pin_reopen_unpin_round_trip`,
+`probe::dns::live_smoke::dns_snoop_captures_and_parses_a_real_containers_dns_answer`,
+`probe::dns::live_smoke::dns_snoop_captures_the_responses_own_source_address`,
+`probe::dns_query::live_smoke::query_response_correlation_recovers_the_correct_container_cgroup`,
+`attribution::resolver::live_smoke::resolves_a_real_container_end_to_end`)
+in one invocation: all six passed together, confirming the eBPF capture
+change didn't regress attach/pin lifecycle, source-address capture, or
+query/response correlation. A genuine bonus finding: chunk #9's own real
+`nslookup`-driven test, in this same run, reported an 85-byte capture --
+that scenario had historically shown 32/64-byte tier-truncated captures
+in this file's own chunk #9 account, so this chunk's fix visibly improved
+a real, non-synthetic capture in the same invocation that was verifying
+the synthetic one.
+
+**Cleanup**: the test's own cgroup directory (moving this process back to
+its original cgroup first) and bpffs pin root were removed by the test's
+own teardown. `bathyscaphe-itest-dnsfix-build` and
+`bathyscaphe-itest-dnsfix-priv` were removed after use; confirmed absent
+via `docker ps -a`. No `bathyscaphe-itest-*` Docker network or container
+was created by this chunk's own new test (it uses a bare loopback socket
+pair, not a Docker container, for the DNS traffic itself); `/sys/fs/bpf`
+and `/sys/fs/cgroup` confirmed to have no leftover `bathyscaphe-itest-*`
+or `bathyscaphe-dnsfix-*` entries after the final run.
+
+### What is still deferred to a later chunk
+
+Everything chunk #9-#11's own "deferred" notes already listed (TCP DNS,
+IPv6 extension headers, DoH/DoT/ECH, rootless Podman) is unchanged by this
+chunk -- it fixed a capture-length correctness bug, not any of the
+structural visibility gaps those chunks already documented honestly.

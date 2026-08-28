@@ -37,8 +37,8 @@
 //! all -- userspace only ever needs the answer (name + resolved
 //! IPs + TTL), never the question packet's own bytes.
 //!
-//! ## Verifier safety: `bpf_skb_load_bytes` with literal-constant lengths,
-//! never raw pointer arithmetic
+//! ## Verifier safety: `bpf_skb_load_bytes` with a clamp-then-mask
+//! computed length, never raw pointer arithmetic
 //!
 //! Every fixed-size read in this module (IP version nibble, IHL, protocol,
 //! ports, the UDP length field) goes through `SkBuffContext::load::<T>()`,
@@ -50,34 +50,65 @@
 //! convenience wrapper for exactly this): that wrapper computes its copy
 //! length as `(skb_len - offset).min(dst.len())`, and the verifier rejects
 //! `bpf_skb_load_bytes`'s length ARGUMENT ("invalid zero-sized read")
-//! whenever its tracked range does not provably exclude zero -- which,
-//! empirically, against this workspace's pinned toolchain and kernel, it
-//! never could be made to, no matter how the surrounding scalar arithmetic
-//! was restructured (an explicit `>=`-branch early-return immediately
-//! before the call still lost its narrowing to `u32` wraparound-truncation
-//! codegen or to imprecise signed/unsigned bound tracking across the
-//! subtraction, depending on which integer width was used). The tiered
-//! loop inside `capture_if_dns_response` (via the local `try_tier!` macro)
-//! sidesteps the entire class of problem by calling `bpf_skb_load_bytes`
-//! several times with LITERAL, compile-time `u32` lengths (512, 384,
-//! 256, ...), largest first, keeping the first that succeeds -- a
-//! literal's range is exactly that one value, trivially nonzero, with no
-//! arithmetic for the verifier to reason about. The kernel itself still
-//! bounds-checks each attempt against the real `sk_buff` length and
-//! returns an error rather than ever reading out of bounds, so nothing
-//! about this is less safe than the convenience wrapper -- it is only
-//! coarser-grained (see "Tier-granular length" below).
+//! whenever its tracked range does not provably exclude zero. Build chunk
+//! #9's first fix for this abandoned a computed length entirely in favor
+//! of a handful of literal, compile-time-constant tiers (512, 384, 256,
+//! 128, 64, 32 bytes), tried largest-first -- which sidestepped the
+//! verifier problem completely (a literal's range is exactly that one
+//! value, trivially nonzero) at the cost of a real correctness bug: a
+//! response whose true length fell strictly BETWEEN two adjacent tiers
+//! (observed live: a genuine ~100-byte answer, between the 64- and
+//! 128-byte tiers) was captured at the next SMALLER tier, silently
+//! TRUNCATING it -- a truncated DNS message fails to parse in userspace,
+//! so that answer never reached the domain cache or the FQDN allow-map at
+//! all. Build chunk #12 fixes this by computing the EXACT clamped length
+//! instead of picking from a coarse ladder, using an idiom that proves
+//! the verifier-required nonzero bound WITHOUT depending on any branch's
+//! narrowing surviving codegen (the specific failure chunk #9's own
+//! investigation hit: an explicit `>=`-branch early-return immediately
+//! before the call still lost its narrowing to `u32`
+//! wraparound-truncation codegen or to imprecise signed/unsigned bound
+//! tracking across a runtime subtraction, depending on which integer
+//! width was used for `skb_len - offset`):
 //!
-//! ## Tier-granular length, not exact
+//! 1. **Clamp** the UDP header's own honest length (`payload_len_hint`,
+//!    read separately, below) to [`bathyscaphe_common::DNS_CAPTURE_MAX`]
+//!    with a plain `if`/`else` -- an ordinary runtime `min`, no
+//!    subtraction against any skb-context-derived value at all (the
+//!    earlier attempts that failed were all subtracting `skb_len`, a
+//!    value with its own uncertain verifier-tracked range; clamping a
+//!    small `u16` header field already loaded via `ctx.load` against a
+//!    compile-time constant is a much simpler computation for the
+//!    verifier, though this step's own narrowing is still not what the
+//!    nonzero proof below depends on -- see the next point).
+//! 2. **Mask, then add one.** Whatever the clamp step's own tracked range
+//!    ends up being (even in the worst case where the compiler loses it
+//!    entirely, as chunk #9 found happens for some arithmetic shapes), a
+//!    bitwise AND against `DNS_CAPTURE_MAX - 1` (a power-of-two mask)
+//!    gives the verifier a FRESH, precise upper bound derived from the AND
+//!    instruction itself -- the eBPF verifier computes an AND's output
+//!    range directly from the mask operand, independent of the input
+//!    register's own prior range. Adding the literal `1` back gives an
+//!    equally fresh, precise LOWER bound of exactly 1 -- an unsigned add
+//!    of a compile-time positive constant has a provable minimum of
+//!    `(prior minimum) + 1`, and the AND's own minimum is triviably `>= 0`
+//!    regardless of its input. The combination proves the final value is
+//!    in `[1, DNS_CAPTURE_MAX]` by construction, satisfying
+//!    `bpf_skb_load_bytes`'s `ARG_CONST_SIZE` requirement -- and, because
+//!    the clamped length is already in `[1, DNS_CAPTURE_MAX]` at runtime
+//!    (payload_len_hint of exactly 0 is special-cased away before this
+//!    code even runs -- see below), subtracting 1, masking, and adding 1
+//!    back is a value-preserving IDENTITY: `safe_len` always equals
+//!    `capped` exactly, so nothing is lost to the trick itself.
 //!
-//! Because the copy length is one of a handful of literal tiers rather
-//! than the payload's exact size, a captured record's `payload` can
-//! include a few bytes past the true UDP payload boundary (whatever
-//! happens to sit there in the `sk_buff`'s linear data). `DnsCapture::len`
-//! is set from the UDP header's OWN length field (trusted, read
-//! separately) clamped to whichever tier actually succeeded -- never the
-//! tier size itself -- so `DnsCapture::captured()` never exposes that
-//! trailing tier padding to the parser. See `docs/DNS.md`.
+//! The kernel still bounds-checks the resulting single `bpf_skb_load_bytes`
+//! call against the real `sk_buff` length and returns an error rather than
+//! ever reading out of bounds; a length the skb genuinely cannot satisfy
+//! (a corrupt/lying UDP length field, or a fragmented/non-linear skb) now
+//! has no smaller-literal-tier fallback to retry -- see
+//! `capture_if_dns_response`'s doc for why this is an acceptable,
+//! genuinely rare edge case rather than the routine question the tiered
+//! design had to answer for every single capture.
 //!
 //! ## What is and is not parsed here
 //!
@@ -217,7 +248,10 @@ fn try_dns_snoop_v6(ctx: &SkBuffContext) -> Result<(), i64> {
 }
 
 /// Shared v4/v6 tail: `l4_offset` is where the UDP header starts. Checks
-/// the source port, then copies the bounded payload and submits it.
+/// the source port, then copies the EXACT (clamped, not tiered) payload
+/// length and submits it -- see this module's doc for the verifier-safe
+/// clamp-then-mask idiom this function uses instead of build chunk #9's
+/// literal-tier ladder.
 ///
 /// ## Never a full `DnsCapture` on the stack
 ///
@@ -250,10 +284,9 @@ fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize, src_addr: [u8;
     let dst_port = u16::from_be_bytes(dst_port_bytes);
 
     // The UDP header's own `length` field (bytes 4-5, header+payload,
-    // network byte order): trusted here purely to learn how many of the
-    // captured bytes are real payload versus tier-padding "garbage" past
-    // the true payload boundary (see the tiered-load comment below) --
-    // never used to size the `bpf_skb_load_bytes` call itself.
+    // network byte order): the authoritative basis for the EXACT copy
+    // length below (clamped to the capture cap), not merely a hint used
+    // to trim tier padding after the fact as it was pre-chunk-#12.
     let udp_len_bytes: [u8; 2] = ctx.load(l4_offset + 4)?;
     let payload_len_hint = u16::from_be_bytes(udp_len_bytes).saturating_sub(UDP_HEADER_LEN as u16);
 
@@ -280,81 +313,68 @@ fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize, src_addr: [u8;
         (*ptr).src_addr = src_addr;
     }
 
-    // Tiered fixed-size loads, largest first: each `bpf_skb_load_bytes`
-    // call below requests a LITERAL, compile-time-constant length (512,
-    // 384, ...), never a computed scalar.
-    //
-    // This is a deliberate departure from the "clamp the length to
-    // whatever's available" shape `SkBuffContext::load_bytes` (and this
-    // module's own earlier draft, calling `bpf_skb_load_bytes` with a
-    // manually range-narrowed scalar) uses: `bpf_skb_load_bytes`'s length
-    // argument has verifier type `ARG_CONST_SIZE`, which is rejected
-    // ("invalid zero-sized read") whenever the argument's tracked range
-    // does not provably exclude zero. Every attempt to derive that
-    // guarantee from a runtime subtraction (`skb_len - offset`), even
-    // behind an explicit `>=` early-return branch immediately before the
-    // call, was observed (against this workspace's pinned toolchain and
-    // kernel) to still leave the verifier unable to conclude the result
-    // is nonzero by the time it reaches the call -- LLVM's BPF backend
-    // codegen for the intervening arithmetic loses the narrowing in ways
-    // that differ depending on whether the subtraction is done in `u32`
-    // (a `<<32`/`>>32` truncate-back-to-32-bits pair for wraparound
-    // semantics resets the tracked lower bound to 0) or `u64` (the
-    // subtraction's SIGNED bound tracking comes out unrelated to the
-    // UNSIGNED bound the preceding `>=` branch established). A literal
-    // integer argument sidesteps the entire class of problem: its range
-    // is exactly that one value, trivially nonzero, with no arithmetic
-    // for the verifier to reason about at all.
-    //
-    // The tradeoff: a captured record's USEFUL length is tier-granular,
-    // not exact -- a 90-byte real DNS message captured via the 128-byte
-    // tier includes 38 bytes of whatever happens to sit past the true
-    // UDP payload in the skb's linear data (padding, or nothing in
-    // particular). `payload_len_hint` (the UDP header's own honest
-    // length field, read above) is what keeps this from leaking into
-    // anything: `Self::len` is set to `payload_len_hint` clamped to
-    // whichever tier actually succeeded, never the tier size itself, so
-    // `DnsCapture::captured()` never exposes that padding to the parser.
-    // See `docs/DNS.md` for this documented as a v1 characteristic, not
-    // a silent gap.
+    if payload_len_hint == 0 {
+        // A zero-length UDP body, or a UDP header claiming less than its
+        // own 8-byte size -- nothing to copy. `len` is already 0 from
+        // `init_at` above. Still submitted (rather than discarded) so the
+        // metadata fields (`dst_port`, `src_addr`, `cgroup_id`) reach
+        // userspace like any other capture; `captured()` on a zero-`len`
+        // record already yields an empty slice.
+        entry.submit(0);
+        return Ok(());
+    }
+
+    // The EXACT (clamped, not tiered) variable-length copy -- see this
+    // module's doc for the full derivation of why the verifier accepts
+    // this single call's length argument.
     //
     // SAFETY: `ptr` was initialized by `init_at` above and remains valid
     // for `DnsCapture::WIRE_SIZE` bytes; `payload_ptr` points at exactly
     // `DNS_CAPTURE_MAX` writable bytes within it, at least as large as
-    // every literal tier requested below.
+    // `safe_len` below can ever be.
     let skb_ptr = ctx.as_ptr();
     let payload_offset_u32 = payload_offset as u32;
     let payload_ptr = unsafe { core::ptr::addr_of_mut!((*ptr).payload).cast::<core::ffi::c_void>() };
 
-    macro_rules! try_tier {
-        ($len:literal) => {
-            if unsafe { bpf_skb_load_bytes(skb_ptr, payload_offset_u32, payload_ptr, $len) } == 0 {
-                Some($len)
-            } else {
-                None
-            }
-        };
-    }
+    // Step 1: clamp. `payload_len_hint` is nonzero here (the `== 0` case
+    // returned above), so `capped` is in `[1, DNS_CAPTURE_MAX]` at
+    // runtime -- a plain compile-time-constant `min`, no subtraction
+    // against any skb-context-derived value.
+    let capped: u32 = if payload_len_hint as u32 > DNS_CAPTURE_MAX as u32 { DNS_CAPTURE_MAX as u32 } else { payload_len_hint as u32 };
 
-    const _TOP_TIER_MATCHES_CAPACITY: () = assert!(512 == DNS_CAPTURE_MAX);
-    let tier_used = try_tier!(512)
-        .or_else(|| try_tier!(384))
-        .or_else(|| try_tier!(256))
-        .or_else(|| try_tier!(128))
-        .or_else(|| try_tier!(64))
-        .or_else(|| try_tier!(32));
+    // Step 2: mask, then add one back. This is a value-preserving
+    // IDENTITY given `capped`'s actual runtime range above (`capped - 1`
+    // is in `[0, DNS_CAPTURE_MAX - 1]`, exactly the mask's own range, so
+    // the AND changes nothing) -- its entire purpose is handing the
+    // verifier a length argument it can prove is in `[1, DNS_CAPTURE_MAX]`
+    // from the AND/ADD instructions THEMSELVES, without depending on
+    // whichever range (if any) it managed to track through step 1's own
+    // branch. See this module's doc for the full reasoning.
+    const DNS_CAPTURE_MASK: u32 = DNS_CAPTURE_MAX as u32 - 1;
+    let safe_len: u32 = ((capped - 1) & DNS_CAPTURE_MASK) + 1;
 
-    let Some(tier_used) = tier_used else {
-        // Not even the smallest tier fit -- no payload at all, or a UDP
-        // header claiming a length the skb doesn't actually have.
+    let ret = unsafe { bpf_skb_load_bytes(skb_ptr, payload_offset_u32, payload_ptr, safe_len) };
+    if ret != 0 {
+        // The skb didn't actually have `safe_len` bytes available past
+        // `payload_offset` -- a corrupt/lying UDP length field, or a
+        // fragmented/non-linear skb the kernel could not satisfy. Unlike
+        // build chunk #9's tiered design, there is no smaller-literal
+        // fallback to retry: this is now a genuinely rare edge case (a
+        // real, intact packet's own UDP length field is, by construction,
+        // never larger than the packet actually carries), not the
+        // routine "which tier fits" question every single capture used
+        // to have to answer.
         entry.discard(0);
         return Ok(());
-    };
+    }
 
-    let useful_len = if payload_len_hint < tier_used { payload_len_hint } else { tier_used };
+    // `safe_len` is a lossless identity transform of `capped` (see step 2
+    // above), and the call just succeeded, so the exact number of bytes
+    // actually copied is `capped` itself: the UDP header's own honest
+    // length, clamped to the cap, with NO tier-granularity truncation.
     // SAFETY: same pointer, still valid; `len` is a plain `u16` field.
     unsafe {
-        (*ptr).len = useful_len;
+        (*ptr).len = capped as u16;
     }
 
     entry.submit(0);
