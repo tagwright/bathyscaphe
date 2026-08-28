@@ -15,16 +15,18 @@
 //!     enforcement                   HashMap<u64 cgroup_id, EnforcementState>
 //!     tamper                        HashMap<u64 cgroup_id, TamperCounter>
 //!     events                        RingBuf -- shared event stream
-//!     dns_events                    RingBuf -- shared DNS-observation stream (build chunk #9)
+//!     dns_events                    RingBuf -- shared DNS-response-observation stream (build chunk #9)
+//!     dns_queries                   RingBuf -- shared DNS-query-observation stream (build chunk #10)
 //!   progs/
-//!     connect4  connect6  sendmsg4  sendmsg6  sock_create  dns_snoop
-//!                                   the six GLOBAL programs: one loaded instance each,
+//!     connect4  connect6  sendmsg4  sendmsg6  sock_create  dns_snoop  dns_query_snoop
+//!                                   the seven GLOBAL programs: one loaded instance each,
 //!                                   attached to every enforced container's cgroup. dns_snoop
-//!                                   (a CgroupSkb program, attached ingress) is pure DNS
-//!                                   observation -- see bathyscaphe-ebpf::dns's module doc.
+//!                                   (a CgroupSkb program, attached ingress) and dns_query_snoop
+//!                                   (a CgroupSkb program, attached egress) are pure DNS
+//!                                   observation -- see bathyscaphe-ebpf::dns/dns_query's module docs.
 //!   links/
 //!     <cgroup_id, 16 lowercase hex digits>/
-//!       connect4  connect6  sendmsg4  sendmsg6  sock_create  dns_snoop
+//!       connect4  connect6  sendmsg4  sendmsg6  sock_create  dns_snoop  dns_query_snoop
 //!                                   per-container attach links, pinned individually so one
 //!                                   container's detach never touches another's
 //! ```
@@ -97,6 +99,7 @@
 pub mod cgroup;
 pub mod clock;
 pub mod dns;
+pub mod dns_query;
 pub mod enforcement;
 pub mod events;
 pub mod kernel_floor;
@@ -116,6 +119,7 @@ use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSock
 use bathyscaphe_common::{EnforcementState, PolicyKeyData, PolicyValue, TamperCounter};
 
 pub use dns::{DnsCallback, DnsCaptureConsumer};
+pub use dns_query::DnsQueryCaptureConsumer;
 pub use enforcement::EnforcementStore;
 pub use events::{EventCallback, EventConsumer};
 pub use layout::{DEFAULT_BPFFS_ROOT, PinPaths};
@@ -139,15 +143,21 @@ pub struct Probe {
     sendmsg4: CgroupSockAddr,
     sendmsg6: CgroupSockAddr,
     sock_create: CgroupSock,
-    /// DNS observation (build chunk #9). A `CgroupSkb` program, attached
-    /// **ingress** -- see `bathyscaphe-ebpf::dns`'s module doc for the
-    /// program-type/direction choice.
+    /// DNS response observation (build chunk #9). A `CgroupSkb` program,
+    /// attached **ingress** -- see `bathyscaphe-ebpf::dns`'s module doc
+    /// for the program-type/direction choice.
     dns_snoop: CgroupSkb,
+    /// DNS query observation (build chunk #10). A `CgroupSkb` program,
+    /// attached **egress** -- see `bathyscaphe-ebpf::dns_query`'s module
+    /// doc for the program-type/direction choice and why egress fixes
+    /// `dns_snoop`'s attribution problem.
+    dns_query_snoop: CgroupSkb,
     pub policy: PolicyStore,
     pub enforcement: EnforcementStore,
     pub tamper: TamperStore,
     events_map: Option<RingBuf<MapData>>,
     dns_events_map: Option<RingBuf<MapData>>,
+    dns_queries_map: Option<RingBuf<MapData>>,
     containers: HashMap<u64, ContainerLinks>,
 }
 
@@ -232,6 +242,7 @@ impl Probe {
         pinned.push(attach_and_pin_sock_addr(&mut self.sendmsg6, "sendmsg6", cgroup_fd, cgroup_id, &self.paths)?);
         pinned.push(attach_and_pin_sock(&mut self.sock_create, "sock_create", cgroup_fd, cgroup_id, &self.paths)?);
         pinned.push(attach_and_pin_cgroup_skb(&mut self.dns_snoop, "dns_snoop", CgroupSkbAttachType::Ingress, cgroup_fd, cgroup_id, &self.paths)?);
+        pinned.push(attach_and_pin_cgroup_skb(&mut self.dns_query_snoop, "dns_query_snoop", CgroupSkbAttachType::Egress, cgroup_fd, cgroup_id, &self.paths)?);
         Ok(pinned)
     }
 
@@ -284,13 +295,11 @@ impl Probe {
         self.dns_events_map.take()
     }
 
-    /// Deletes every policy entry in the shared trie whose `expires_at_ns`
-    /// has passed, using the real `CLOCK_BOOTTIME` clock. See
-    /// [`PolicyStore::reap_expired`] for why this matters beyond simple
-    /// cleanup.
-    pub fn reap_expired_policy(&mut self) -> Result<usize> {
-        let now = clock::now_boottime_ns()?;
-        self.policy.reap_expired(now)
+    /// Takes ownership of the `DNS_QUERIES` ring buffer (build chunk #10),
+    /// for handing to [`DnsQueryCaptureConsumer::spawn`]. Returns `None` if
+    /// already taken.
+    pub fn take_dns_queries(&mut self) -> Option<RingBuf<MapData>> {
+        self.dns_queries_map.take()
     }
 
     /// Standalone break-glass: removes the entire pin subtree at `root`,
@@ -324,6 +333,7 @@ fn load_fresh_and_pin(ebpf_object: &[u8], paths: &PinPaths) -> Result<()> {
     load_and_pin_sock_addr(&mut ebpf, "sendmsg6", paths)?;
     load_and_pin_sock(&mut ebpf, "sock_create", paths)?;
     load_and_pin_cgroup_skb(&mut ebpf, "dns_snoop", paths)?;
+    load_and_pin_cgroup_skb(&mut ebpf, "dns_query_snoop", paths)?;
 
     for (ebpf_name, pin_basename) in MAP_PIN_NAMES {
         let map = ebpf.take_map(ebpf_name).with_context(|| format!("map `{ebpf_name}` not found in the embedded eBPF object"))?;
@@ -373,12 +383,14 @@ fn reopen_from_pins(paths: PinPaths) -> Result<Probe> {
     let sendmsg6 = reopen_sock_addr(&paths, "sendmsg6", CgroupSockAddrAttachType::UDPSendMsg6)?;
     let sock_create = reopen_sock(&paths, "sock_create", CgroupSockAttachType::SockCreate)?;
     let dns_snoop = reopen_cgroup_skb(&paths, "dns_snoop", CgroupSkbAttachType::Ingress)?;
+    let dns_query_snoop = reopen_cgroup_skb(&paths, "dns_query_snoop", CgroupSkbAttachType::Egress)?;
 
     let policy_trie: LpmTrie<MapData, PolicyKeyData, PolicyValue> = reopen_map(&paths, "policy")?;
     let enforcement_map: BpfHashMap<MapData, u64, EnforcementState> = reopen_map(&paths, "enforcement")?;
     let tamper_map: BpfHashMap<MapData, u64, TamperCounter> = reopen_map(&paths, "tamper")?;
     let events_map: RingBuf<MapData> = reopen_map(&paths, "events")?;
     let dns_events_map: RingBuf<MapData> = reopen_map(&paths, "dns_events")?;
+    let dns_queries_map: RingBuf<MapData> = reopen_map(&paths, "dns_queries")?;
 
     let containers = discover_containers(&paths)?;
 
@@ -390,11 +402,13 @@ fn reopen_from_pins(paths: PinPaths) -> Result<Probe> {
         sendmsg6,
         sock_create,
         dns_snoop,
+        dns_query_snoop,
         policy: PolicyStore::new(policy_trie),
         enforcement: EnforcementStore::new(enforcement_map),
         tamper: TamperStore::new(tamper_map),
         events_map: Some(events_map),
         dns_events_map: Some(dns_events_map),
+        dns_queries_map: Some(dns_queries_map),
         containers,
     })
 }

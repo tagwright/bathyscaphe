@@ -35,6 +35,12 @@ const EVENTS_BYTE_SIZE: u32 = 256 * 1024;
 /// of the `EVENTS` sizing on purpose -- see `bathyscaphe_common::dns`'s
 /// module doc for why this is a *separate* ring rather than a shared one.
 const DNS_EVENTS_BYTE_SIZE: u32 = 128 * 1024;
+/// 32 KiB. `DnsQueryCapture` records (24 bytes each, build chunk #10) are
+/// smaller than `DnsCapture`'s and there is at most one outbound query per
+/// inbound answer this workload will ever generate, so this ring can be
+/// smaller than [`DNS_EVENTS_BYTE_SIZE`] while still comfortably holding a
+/// burst of concurrent lookups.
+const DNS_QUERIES_BYTE_SIZE: u32 = 32 * 1024;
 
 /// The shared policy trie. Key: `cgroup_id (8 bytes) || addr (16 bytes)`,
 /// `prefix_len` always `>= PolicyKeyData::MIN_PREFIX_LEN` for any stored
@@ -67,3 +73,13 @@ pub static EVENTS: RingBuf = RingBuf::with_byte_size(EVENTS_BYTE_SIZE, 0);
 /// doc.
 #[map]
 pub static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(DNS_EVENTS_BYTE_SIZE, 0);
+
+/// The DNS QUERY-observation output ring (build chunk #10), written by
+/// `dns_query_snoop` (`bathyscaphe-ebpf::dns_query`) for every recognized
+/// DNS-query UDP datagram LEAVING a container. Separate from both
+/// [`EVENTS`] and [`DNS_EVENTS`] for the identical independent-failure-mode
+/// reasoning [`DNS_EVENTS_BYTE_SIZE`]'s doc gives -- a burst of queries
+/// dropped here degrades correlation confidence only, never the answer
+/// capture stream or connect-event observation.
+#[map]
+pub static DNS_QUERIES: RingBuf = RingBuf::with_byte_size(DNS_QUERIES_BYTE_SIZE, 0);

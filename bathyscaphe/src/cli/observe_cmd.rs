@@ -52,10 +52,10 @@ use std::time::Duration;
 use bathyscaphe_proto::UpMessage;
 
 use crate::attribution::{AttributionService, Attributor, Resolver};
-use crate::dns::DomainCache;
+use crate::dns::{DomainCache, PendingQueryTable};
 use crate::pipeline::{EventSink, Pipeline};
 use crate::probe::layout::{PinPaths, PinState, pin_state};
-use crate::probe::{DnsCaptureConsumer, EventConsumer, Probe};
+use crate::probe::{DnsCaptureConsumer, DnsQueryCaptureConsumer, EventConsumer, Probe};
 
 use super::log::Logger;
 use super::{ObserveArgs, ObserveFormat};
@@ -144,9 +144,23 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let dns_query_ring = match probe.take_dns_queries() {
+        Some(ring) => ring,
+        None => {
+            logger.error("cli.observe.no_dns_query_ring", "the probe's DNS query ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)");
+            attribution.stop();
+            return ExitCode::from(1);
+        }
+    };
 
     let shared_probe = Arc::new(Mutex::new(probe));
     let domain_cache = Arc::new(Mutex::new(DomainCache::new()));
+    // Query/response correlation (build chunk #10) improves this session's
+    // own `domain.*` enrichment quality the same way it feeds `run`'s FQDN
+    // enforcement -- `observe` has no policy directives to enforce, so it
+    // only ever consumes the corrected cgroup_id for cache attribution,
+    // never for a POLICY insertion.
+    let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
     let sink = ObservePrinter { format: args.format, container_filter: args.container.clone() };
     let pipeline = match Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), sink) {
         Ok(pipeline) => pipeline,
@@ -161,7 +175,11 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
     // (build chunk #9): its own DNS ring-buffer consumer feeding its own,
     // session-local `DomainCache` -- torn down with everything else on
     // exit, since this whole mode is ephemeral (see this module's doc).
-    let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache)));
+    // The query consumer (build chunk #10) feeds the same session-local
+    // correlation table; the answer consumer's `on_answer` hook is a no-op
+    // here since `observe` never inserts POLICY entries.
+    let dns_query_consumer = DnsQueryCaptureConsumer::spawn(dns_query_ring, crate::dns::query_capture_callback(Arc::clone(&pending)));
+    let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache), Arc::clone(&pending), |_answer| {}));
 
     logger.info("cli.observe.watching", "watching for egress events; Ctrl-C to detach and exit");
     while !STOP.load(Ordering::SeqCst) {
@@ -175,6 +193,7 @@ pub fn run(args: ObserveArgs, logger: &Logger) -> ExitCode {
     logger.info("cli.observe.stopping", "Ctrl-C received; detaching this session's containers and exiting");
     consumer.stop();
     dns_consumer.stop();
+    dns_query_consumer.stop();
     attribution.stop();
 
     {

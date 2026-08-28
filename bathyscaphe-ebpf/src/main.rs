@@ -2,7 +2,7 @@
 //! `bathyscaphe-ebpf`: the kernel-side programs, built with `bpf-linker`
 //! against a `bpfel`/`bpfeb`-unknown-none target (see docs/BUILDING.md).
 //!
-//! Six attach points, all sharing the maps in [`maps`] and the single
+//! Seven attach points, all sharing the maps in [`maps`] and the single
 //! decision routine in [`decide`] (`bathy_ebpf_design.md` sections 1a and
 //! 6):
 //!
@@ -20,16 +20,26 @@
 //!   attach type `BPF_CGROUP_INET_SOCK_CREATE`) — implemented, not
 //!   deferred.
 //! - `cgroup_skb` (attached ingress, function name `dns_snoop`) — DNS
-//!   observation (build chunk #9): recognizes a UDP:53-sourced datagram
-//!   and captures a bounded prefix of its payload for userspace to parse.
-//!   Pure observation, always returns `1` (pass) regardless of what it
-//!   finds — see [`dns::try_dns_snoop`]'s module doc for the full design.
+//!   response observation (build chunk #9): recognizes a UDP:53-sourced
+//!   datagram and captures a bounded prefix of its payload for userspace
+//!   to parse. Pure observation, always returns `1` (pass) regardless of
+//!   what it finds — see [`dns::try_dns_snoop`]'s module doc for the full
+//!   design.
+//! - `cgroup_skb` (attached egress, function name `dns_query_snoop`) — DNS
+//!   QUERY observation (build chunk #10): recognizes a UDP:53-destined
+//!   datagram LEAVING the container and captures its transaction id, its
+//!   source port, and the CORRECT cgroup id (the querying container's own
+//!   — egress never suffers the resolver-injection attribution problem
+//!   `dns_snoop` documents), so userspace can correlate a later response
+//!   back to the right container. Also pure observation — see
+//!   [`dns_query::try_dns_query_snoop`]'s module doc.
 #![no_std]
 #![no_main]
 
 mod convert;
 mod decide;
 mod dns;
+mod dns_query;
 mod maps;
 
 use aya_ebpf::{
@@ -133,6 +143,16 @@ fn try_sock_create(ctx: SockContext) -> Result<i32, i32> {
 #[cgroup_skb]
 pub fn dns_snoop(ctx: SkBuffContext) -> i32 {
     let _ = dns::try_dns_snoop(&ctx);
+    1
+}
+
+/// DNS query observation (build chunk #10). Attached **egress** (chosen at
+/// attach time in userspace — see `dns_query::try_dns_query_snoop`'s module
+/// doc). Always returns `1` (pass): pure observation, exactly like
+/// `dns_snoop`.
+#[cgroup_skb]
+pub fn dns_query_snoop(ctx: SkBuffContext) -> i32 {
+    let _ = dns_query::try_dns_query_snoop(&ctx);
     1
 }
 

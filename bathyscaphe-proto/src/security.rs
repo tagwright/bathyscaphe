@@ -46,10 +46,14 @@ use serde_json::Value;
 /// additive; a consumer that does not recognize one still has a usable
 /// `severity_number` and `body`.
 pub mod reason {
-    /// A `type: "name"` rule is active in `mode: block` on a backend (or
-    /// against traffic) that cannot enforce it. Per the ratified
-    /// unenforceable-name policy, the traffic is failed CLOSED (denied),
-    /// loudly, rather than silently failed open.
+    /// A `type: "name"` rule is active in `mode: block` on a backend that
+    /// cannot enforce name rules AT ALL (no `enforce_fqdn` capability).
+    /// Reserved for such a build: per the ratified unenforceable-name
+    /// policy, the traffic is failed CLOSED (denied), loudly, rather than
+    /// silently failed open. A build advertising `enforce_fqdn` (build
+    /// chunk #10 onward) never emits this reason -- its name rules ARE
+    /// enforceable, so a connect-time miss uses
+    /// [`POLICY_NAME_UNRESOLVED_BLOCK`] instead, a distinct condition.
     pub const POLICY_UNENFORCEABLE_NAME: &str = "policy.unenforceable_name";
     /// The tamper counter (`events_dropped_total`) moved for a container.
     pub const TAMPER_EVENT_DROPS: &str = "tamper.event_drops";
@@ -58,6 +62,17 @@ pub mod reason {
     pub const POLICY_VIOLATION: &str = "policy.violation";
     /// A connection was actually blocked in-kernel (`mode: block`).
     pub const ENFORCE_BLOCKED: &str = "enforce.blocked";
+    /// Build chunk #10: under `enforce_fqdn`, a container holding at least
+    /// one active `Allow` name rule was denied a connection to a
+    /// destination this build never observed a DNS answer for (raw-IP
+    /// egress bypassing DNS entirely, or a DoH/DoT/ECH lookup this build
+    /// structurally cannot see). Distinct from [`POLICY_UNENFORCEABLE_NAME`]:
+    /// the NAME rule itself is perfectly enforceable here, there is simply
+    /// no visible DNS mapping to the destination actually reached, so the
+    /// connection fails CLOSED per the same fail-closed posture, reported
+    /// as the honest "name-allowed destination reached without a visible
+    /// DNS answer" signal rather than an opaque, unexplained deny.
+    pub const POLICY_NAME_UNRESOLVED_BLOCK: &str = "policy.name_unresolved_block";
 }
 
 /// OTel severity number scale, restricted to the three levels beacon

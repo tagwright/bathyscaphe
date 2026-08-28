@@ -44,11 +44,11 @@ pub const DNS_CAPTURE_MAX: usize = 512;
 /// Field order and the explicit `_pad` follow the same deterministic,
 /// zero-implicit-padding convention as every other kernel/user boundary
 /// type in this crate (see [`crate::policy::PolicyValue`]'s doc): the two
-/// `u64`s reach 8-byte alignment with no compiler-inserted gap, `len` (a
-/// `u16`) needs no gap after them, and `_pad` rounds up to a multiple of 8
-/// before `payload` (whose own alignment is 1, so it needs no padding of
-/// its own) so every byte that crosses the kernel/user boundary as
-/// `aya::Pod` is deterministically initialized.
+/// `u64`s reach 8-byte alignment with no compiler-inserted gap, `len`/
+/// `dst_port` (two `u16`s) need no gap after them, and `_pad` rounds up to
+/// a multiple of 8 before `payload` (whose own alignment is 1, so it needs
+/// no padding of its own) so every byte that crosses the kernel/user
+/// boundary as `aya::Pod` is deterministically initialized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct DnsCapture {
@@ -59,17 +59,40 @@ pub struct DnsCapture {
     pub ktime_ns: u64,
     /// `bpf_get_current_cgroup_id()`: which container observed this DNS
     /// traffic. Userspace's per-container IP->domain cache is keyed on
-    /// this, exactly like [`crate::event::Event::cgroup_id`].
+    /// this, exactly like [`crate::event::Event::cgroup_id`] -- but see
+    /// `docs/DNS.md`'s attribution caveat: for a reply synthesized/injected
+    /// by a resolver such as Docker's embedded `127.0.0.11`, THIS value is
+    /// the RESOLVER's cgroup, not necessarily the querying container's.
+    /// [`Self::dst_port`] (build chunk #10) is what lets userspace recover
+    /// the correct cgroup via query/response correlation.
     pub cgroup_id: u64,
     /// How many leading bytes of [`Self::payload`] the kernel actually
     /// wrote (bounded by both the real UDP payload length and
     /// [`DNS_CAPTURE_MAX`]). Never trust bytes at index `>= len` --
     /// they are zero-initialized, not truncated message content.
     pub len: u16,
-    _pad: [u8; 6],
+    /// The UDP destination port this response arrived on, network byte
+    /// order stored host-endian here (a plain `u16`, unlike the raw
+    /// `[u8; 2]` convention `bathyscaphe_common::event::Event` uses for
+    /// wire ports -- this value never crosses back onto the wire itself,
+    /// it only ever feeds a userspace hash-map key, so there is no
+    /// byte-order ambiguity to preserve). This is the querying process's
+    /// own ephemeral source port from the original DNS query -- build
+    /// chunk #10's query/response correlation
+    /// (`bathyscaphe::dns::pending::PendingQueryTable`) matches this
+    /// against a captured query's `src_port` (same value) plus both
+    /// messages' shared DNS transaction id to recover the CORRECT
+    /// querying container's cgroup id when [`Self::cgroup_id`] above is
+    /// wrong (the Docker-embedded-DNS / Tailscale-intercepted-DNS case
+    /// `docs/DNS.md` documents).
+    pub dst_port: u16,
+    _pad: [u8; 4],
     /// The raw, unparsed UDP payload bytes (a DNS message, if the source
     /// port really was 53 and the sender is honest -- see `docs/DNS.md`
-    /// for the spoofing caveat). Only `payload[..len]` is meaningful.
+    /// for the spoofing caveat). Only `payload[..len]` is meaningful. The
+    /// message's own transaction id (the first two bytes) is what
+    /// query/response correlation matches against a captured query's own
+    /// transaction id.
     pub payload: [u8; DNS_CAPTURE_MAX],
 }
 
@@ -91,7 +114,7 @@ impl DnsCapture {
     /// already-allocated destination memory (a `RingBuf` reserved slot)
     /// instead of ever materializing a full `Self` on the stack.
     pub const fn zeroed_for(cgroup_id: u64, ktime_ns: u64) -> Self {
-        Self { ktime_ns, cgroup_id, len: 0, _pad: [0; 6], payload: [0u8; DNS_CAPTURE_MAX] }
+        Self { ktime_ns, cgroup_id, len: 0, dst_port: 0, _pad: [0; 4], payload: [0u8; DNS_CAPTURE_MAX] }
     }
 
     /// Initializes a `DnsCapture` **in place** at `ptr`: every field is
@@ -121,7 +144,8 @@ impl DnsCapture {
             core::ptr::addr_of_mut!((*ptr).ktime_ns).write(ktime_ns);
             core::ptr::addr_of_mut!((*ptr).cgroup_id).write(cgroup_id);
             core::ptr::addr_of_mut!((*ptr).len).write(0);
-            core::ptr::addr_of_mut!((*ptr)._pad).write([0u8; 6]);
+            core::ptr::addr_of_mut!((*ptr).dst_port).write(0);
+            core::ptr::addr_of_mut!((*ptr)._pad).write([0u8; 4]);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*ptr).payload).cast::<u8>(), 0, DNS_CAPTURE_MAX);
         }
     }
@@ -139,18 +163,120 @@ impl DnsCapture {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for DnsCapture {}
 
+/// The kernel-written DNS QUERY capture record: what the egress DNS-query
+/// snoop program (`bathyscaphe-ebpf::dns_query`, build chunk #10) writes
+/// into the `DNS_QUERIES` `RingBuf` for every UDP datagram it recognizes as
+/// a DNS query (destination port 53) LEAVING a monitored container.
+///
+/// ## Why this exists: correct attribution at the SOURCE
+///
+/// `docs/DNS.md` documents that [`DnsCapture::cgroup_id`] can be wrong for
+/// a response synthesized/injected by a resolver (Docker's embedded
+/// `127.0.0.11`, a Tailscale-intercepted resolver) rather than delivered
+/// over a real NIC/veth path: `bpf_get_current_cgroup_id()` at that INGRESS
+/// hook reports the RESOLVER's cgroup, not the querying container's. The
+/// outbound QUERY, by contrast, always fires in the container's OWN
+/// cgroup -- it is that container's own process making an ordinary
+/// `sendto()`/`send()` call on its own socket, with no resolver-side
+/// injection involved on the egress path. Capturing the query's identity
+/// (transaction id + source port) alongside its CORRECT cgroup id gives
+/// userspace (`bathyscaphe::dns::pending::PendingQueryTable`) what it needs
+/// to correlate a later response back to the right container, overriding
+/// the response hook's own (possibly wrong) attribution.
+///
+/// ## Deliberately minimal: no query NAME captured
+///
+/// Parsing the query's QNAME in-kernel would need the same
+/// variable-length-label handling [`DnsCapture`]'s own doc explains the
+/// eBPF verifier handles poorly -- and it is unnecessary here: the
+/// RESPONSE (already captured in full by `dns_snoop`, ingress) carries the
+/// queried name back in its own question section, which userspace already
+/// parses via `simple-dns`. This record's whole job is correlation
+/// identity (txid + port + the correct cgroup id), nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct DnsQueryCapture {
+    /// `bpf_ktime_get_boot_ns()` at capture time -- the instant the query
+    /// left the container, used as the correlation table's insertion time
+    /// for its own short TTL.
+    pub ktime_ns: u64,
+    /// `bpf_get_current_cgroup_id()` at the EGRESS hook: the querying
+    /// container's own cgroup, correctly attributed by construction (see
+    /// this struct's module-level doc) -- this is the value query/response
+    /// correlation recovers for a response whose own [`DnsCapture::cgroup_id`]
+    /// is wrong.
+    pub cgroup_id: u64,
+    /// The DNS message's transaction id (the first two bytes of the UDP
+    /// payload), host-endian. Matched against a captured response's own
+    /// transaction id (the first two bytes of [`DnsCapture::payload`],
+    /// decoded the same way by the correlation table).
+    pub txid: u16,
+    /// The query's UDP source port -- the ephemeral port the querying
+    /// process's socket used, and the SAME port the resolver's reply is
+    /// addressed back to (that reply's [`DnsCapture::dst_port`]). This is
+    /// the other half of the `(txid, port)` correlation key.
+    pub src_port: u16,
+    _pad: [u8; 4],
+}
+
+impl DnsQueryCapture {
+    /// The struct's pinned wire size, named for the same reason
+    /// [`DnsCapture::WIRE_SIZE`] is.
+    pub const WIRE_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// Trivial constructor. Unlike [`DnsCapture`], this struct is small
+    /// enough (24 bytes, comfortably under the eBPF stack limit even
+    /// alongside everything else a program frame needs) to build by value
+    /// on the stack and hand to `RingBuf::reserve::<Self>(0)`'s
+    /// `entry.write(...)` -- the same convention
+    /// `bathyscaphe-ebpf::decide::emit_event` already uses for the
+    /// similarly small `Event` struct. No `init_at`-style raw-pointer
+    /// constructor is needed here.
+    pub const fn new(ktime_ns: u64, cgroup_id: u64, txid: u16, src_port: u16) -> Self {
+        Self { ktime_ns, cgroup_id, txid, src_port, _pad: [0; 4] }
+    }
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DnsQueryCapture {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const _DNS_CAPTURE_SIZE: () = assert!(core::mem::size_of::<DnsCapture>() == 24 + DNS_CAPTURE_MAX);
     const _DNS_CAPTURE_ALIGN: () = assert!(core::mem::align_of::<DnsCapture>() == 8);
+    const _DNS_QUERY_CAPTURE_SIZE: () = assert!(core::mem::size_of::<DnsQueryCapture>() == 24);
+    const _DNS_QUERY_CAPTURE_ALIGN: () = assert!(core::mem::align_of::<DnsQueryCapture>() == 8);
 
     #[test]
     fn dns_capture_is_pinned() {
         assert_eq!(core::mem::size_of::<DnsCapture>(), 24 + DNS_CAPTURE_MAX);
         assert_eq!(core::mem::align_of::<DnsCapture>(), 8);
         assert_eq!(DnsCapture::WIRE_SIZE, 24 + DNS_CAPTURE_MAX);
+    }
+
+    #[test]
+    fn dns_capture_carries_dst_port() {
+        let mut capture = DnsCapture::zeroed_for(1, 1);
+        capture.dst_port = 54321;
+        assert_eq!(capture.dst_port, 54321);
+    }
+
+    #[test]
+    fn dns_query_capture_is_pinned() {
+        assert_eq!(core::mem::size_of::<DnsQueryCapture>(), 24);
+        assert_eq!(core::mem::align_of::<DnsQueryCapture>(), 8);
+        assert_eq!(DnsQueryCapture::WIRE_SIZE, 24);
+    }
+
+    #[test]
+    fn dns_query_capture_round_trips_its_fields() {
+        let capture = DnsQueryCapture::new(42, 0xABCD, 0x1234, 5353);
+        assert_eq!(capture.ktime_ns, 42);
+        assert_eq!(capture.cgroup_id, 0xABCD);
+        assert_eq!(capture.txid, 0x1234);
+        assert_eq!(capture.src_port, 5353);
     }
 
     #[test]

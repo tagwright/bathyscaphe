@@ -1,13 +1,17 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# DNS observation
+# DNS observation and FQDN enforcement
 
-Build chunk #9 of the sequence in `bathy_build_spec.md`. This document is
-the honest account of what bathyscaphe's DNS-snoop layer sees, what it
+Build chunks #9 (DNS observation) and #10 (query/response correlation +
+FQDN enforcement) of the sequence in `bathy_build_spec.md`. This document
+is the honest account of what bathyscaphe's DNS layer sees, what it
 structurally cannot see, and how the pieces fit together. IP/CIDR policy
 remains the ground truth throughout (`bathy_build_spec.md`'s BUILD-THROUGH
-STANCE); everything here is enrichment now, and in chunk #10 becomes
-best-effort FQDN enforcement layered on top of that same ground truth,
-never a replacement for it.
+STANCE); FQDN enforcement (chunk #10) is best-effort, layered on top of
+that same ground truth, never a replacement for it -- stated plainly, not
+just implied: a name rule can only ever ADD host routes to the allow-map
+that IP/CIDR policy already governs, and every gap documented below falls
+straight back to the container's ordinary IP/CIDR default, never to a
+silent allow.
 
 ## What is captured, and how
 
@@ -87,7 +91,14 @@ container's actual connectivity.
   this is purely an attribution nuance of how cgroup-scoped eBPF hooks
   interact with in-kernel/injected delivery paths for specific resolver
   implementations, not a parsing or capture defect. `docs/TESTING.md` has
-  the full account, including the raw bytes that proved it.
+  the full account, including the raw bytes that proved it. **This is
+  FIXED as of chunk #10** for the Docker-embedded-DNS case specifically,
+  via query/response correlation (`bathyscaphe::dns::pending`) -- see
+  "Chunk #10: the query/response correlation fix" below for the full
+  design and the empirical proof this fix actually works, and "Full
+  residual limitation list" for exactly which attribution paths remain
+  uncorrelated (an uncorrelated response still falls back to this
+  chunk's original, possibly-wrong, attribution, marked low-confidence).
 - **Spoofing**: `dns_snoop` trusts *any* UDP:53-sourced datagram reaching
   the container's ingress path -- there is no allow-list of trusted
   resolver addresses (unlike Calico/NSX's explicit "trusted DNS servers"
@@ -226,38 +237,315 @@ free.
 
 ## Capability
 
-`hello.capabilities` now includes `dns_enrich` (`daemon::hello`).
-`enforce_fqdn` (chunk #10) is deliberately still absent -- see
-`docs/PROTOCOL.md` section 2 on why advertising an unbuilt capability
-would turn a `policy` sender's `mode: block` on a name rule into a silent
-downgrade rather than the sticky validation error the wire protocol
-requires.
+`hello.capabilities` includes `dns_enrich` (chunk #9, `daemon::hello`) and,
+as of chunk #10, `enforce_fqdn` too -- see the "The `enforce_fqdn`
+capability" section below for what changed and why it is now safe to
+advertise (name rules are genuinely enforced, not merely counted).
 
-## What chunk #10 (FQDN enforcement) plugs into
+## Chunk #10: the query/response correlation fix
 
-1. **The cache API**: `bathyscaphe::dns::cache::DomainCache::lookup` and
-   `::record` are the whole public surface. Chunk #10 does not need to
-   rebuild parsing or capture -- it reads (or extends the writer of) the
-   same cache this chunk populates.
-2. **Where name-rule patterns register**: a container's compiled `type:
-   "name"` rules (`docs/PROTOCOL.md` section 4) should be kept alongside
-   `daemon::state::ContainerState` (or a sibling structure), so that on
-   every `DomainCache::record` call (or a new hook alongside it), chunk
-   #10 can check whether the just-observed `domain` matches one of that
-   container's enforceable patterns (exact name or `*.wildcard`).
-3. **Inserting resolved IPs into the policy allow-map**: on a match,
-   chunk #10 writes the resolved address into `POLICY`
-   (`bathyscaphe_common::policy`, via `probe::policy::PolicyStore::set_policy`)
-   as a host-route entry (`prefix_bits_over_addr = 128`), with
-   `source: RuleSource::Dns` and an `expires_at_ns` computed from the
-   SAME `(ttl_secs, now_boottime_ns)` pair `DomainCache::record` already
-   receives -- the enrichment cache and the enforcement allow-map should
-   agree on the exact same absolute expiry instant, not derive it twice.
-4. **Unenforceable names in block mode**: per `bathy_build_spec.md`'s
-   ratified NAME-RULE RESOLUTION stance, a name rule that has never been
-   resolved (DoH bypass, cache miss, grace-window expiry) in `mode: block`
-   fails CLOSED on that traffic with loud accounting (R1's `security`
-   record, `reason: policy.unenforceable_name`) -- never fail-open. This
-   chunk does not implement that decision path; it only makes sure the
-   cache chunk #10 needs to consult already exists, is tested, and is
-   documented honestly about when it does and does not have an answer.
+### The attribution problem, restated precisely
+
+`dns_snoop`'s ingress capture attributes a DNS RESPONSE to whichever
+cgroup `bpf_get_current_cgroup_id()` reports at the moment the hook
+fires -- correct for a reply delivered over a real NIC/veth boundary, but
+WRONG (the resolver's own cgroup: `docker.service`, `tailscaled.service`)
+for a reply synthesized/injected directly into the container's netns, the
+common case under Docker's embedded per-container resolver at
+`127.0.0.11` (the default for compose/user-defined networks). Since the
+CIDR/host-route enforcement layer keys every allow-map entry by
+`cgroup_id`, inserting a DNS-derived host route under the wrong cgroup
+would either enforce nothing for the container that actually needs it, or
+(worse) leak an allow entry onto an unrelated cgroup.
+
+### The fix: correlate against the container's own OUTBOUND query
+
+The insight (validated empirically below, not merely asserted): a
+container's DNS QUERY, unlike the response, never suffers this problem.
+`bathyscaphe-ebpf::dns_query`'s new EGRESS `cgroup_skb` program
+(`dns_query_snoop`, the 7th kernel program) fires on the container's own
+`sendto()`/`send()` call on its own UDP socket -- there is no resolver-side
+injection on the way OUT, so `bpf_get_current_cgroup_id()` there is
+ALWAYS the querying container's real cgroup, by construction.
+`dns_query_snoop` captures just enough to identify the query later: the
+DNS transaction id (the first two bytes of the UDP payload), the query's
+own source port, the correct cgroup id, and a timestamp -- into a new,
+dedicated `DNS_QUERIES` ring buffer (`bathyscaphe_common::DnsQueryCapture`,
+24 bytes, small enough to build by value on the eBPF stack, unlike the
+536-byte `DnsCapture`). It deliberately does NOT parse the query's name --
+see that struct's doc for why the response (already fully captured) makes
+that redundant.
+
+`bathyscaphe::dns::pending::PendingQueryTable` is the userspace bridge:
+every captured query records `(txid, src_port) -> {cgroup_id,
+inserted_at}`; every captured response looks up `(txid, dst_port)` -- the
+response's destination port IS the original query's source port, since
+that is where the resolver addresses its reply -- and, on a hit, recovers
+the CORRECT cgroup id, overriding the response hook's own attribution.
+`PENDING_QUERY_TTL_NS` is 5 seconds (comfortably longer than any real
+resolver round trip, short enough that an unanswered query does not
+linger); sweeping is opportunistic (mirrors `DomainCache`'s own
+sweep-on-every-write convention), and a correlated entry is NOT removed on
+its first match, so more than one response datagram for the same query
+(a duplicate/retransmit, or separate A/AAAA answers reusing the same
+transaction id and port) all still correlate. The correlation key is
+`(txid, port)` only, deliberately without a resolver-address component --
+see that module's doc for the documented, judged-acceptable residual risk
+this simplification carries.
+
+**The uncorrelatable fallback**: `crate::dns::capture_callback` falls back
+to the response capture's OWN `cgroup_id` whenever no matching query was
+ever recorded (the query's own capture was dropped by a full
+`DNS_QUERIES` ring, the query used TCP, or the response arrived more than
+`PENDING_QUERY_TTL_NS` after it) and marks the resulting
+`AttributedAnswer::correlated` field `false` -- callers can see the
+confidence signal, though the whole pipeline (cache recording, FQDN
+enforcement) still functions identically either way; there is no
+"discard an uncorrelated answer" behavior, since the pre-chunk-10
+response-hook attribution is still the best available information in that
+case, exactly as chunk #9 shipped it.
+
+### Empirical investigation: what actually happened on this host
+
+Per the build brief's mandate, this was investigated directly against a
+real Docker container on a real user-defined bridge network (which is
+what gets Docker's embedded resolver at `127.0.0.11` -- the default
+`bridge` network does not), kernel 6.8.0-136, `--privileged
+--cgroupns=host`, three separate container lifetimes.
+
+**A real, unanticipated finding surfaced first**: a naive
+`dst_port == 53` match on the egress query snoop captured NOTHING, even
+though the corresponding response WAS captured (proving the query really
+was sent and answered). A temporary diagnostic build that captured every
+egress UDP datagram regardless of port revealed why: the query's
+destination port AT THE EGRESS HOOK was a random high port (55561, 55508,
+and 48204 across the three runs -- never 53), while its source port
+exactly matched the following response's destination port every time
+(proving these captures really were the query/response pair, just not
+recognizable by port alone). The cause: Docker's embedded resolver is not
+actually bound to `127.0.0.11:53`; a per-network-namespace iptables `DNAT`
+rule rewrites a query addressed there to an internal, randomly-allocated
+port where the real resolver listens, and `cgroup_skb`'s
+`BPF_CGROUP_INET_EGRESS` attach point fires AFTER that `LOCAL_OUT`
+netfilter NAT processing -- so the program only ever sees the
+ALREADY-REWRITTEN port. (`dns_snoop`'s ingress side is unaffected because
+conntrack un-NATs the RETURN leg symmetrically before the ingress hook
+runs -- the same NAT rule affects the two directions asymmetrically.)
+
+**The fix applied**: `dns_query_snoop` matches EITHER the genuine
+port-53 case (a query sent directly to an external resolver over a path
+with no local NAT involved) OR a destination address of `127.0.0.11`
+(`DOCKER_EMBEDDED_DNS_V4` in `bathyscaphe-ebpf::dns_query`) regardless of
+port -- the DNAT rule rewrites the port but never the address, so the
+address is a NAT-invariant signal specifically for this one well-known
+resolver. This is a targeted, Docker-specific special case, not a general
+"any locally-DNAT'd UDP traffic" heuristic; see "Residual limitations"
+below for what it does not cover.
+
+**Result after the fix, precisely**: `verifier ACCEPTED` all seven
+programs, `attach_container` succeeded, and re-running the SAME test
+three times (once immediately after the fix, once alongside every other
+`live_smoke` test in one invocation) produced, every time:
+
+- The egress query snoop's captured `cgroup_id` matched the test
+  container's real cgroup id EXACTLY, in every captured query, every run
+  (`query_cgroup_matched_container=true`, unconditionally) -- the
+  foundational claim this whole design rests on, PROVEN, not assumed.
+- The response's OWN captured `cgroup_id` matched `docker.service`'s
+  cgroup, NOT the container's -- chunk #9's misattribution finding
+  reproduced exactly, on demand, every run.
+- `PendingQueryTable::correlate`, given the response's own `(txid,
+  dst_port)`, recovered the CONTAINER's cgroup id -- overriding the
+  response hook's wrong attribution -- in every captured answer, every
+  run, with zero misses.
+
+This is the complete, decisive proof the build brief asked for: query/
+response correlation demonstrably fixes the Docker-embedded-DNS
+attribution problem on a real host, end to end, not merely in a unit
+test with synthetic data (`dns::pending::tests::correlation_recovers_the_querying_containers_cgroup_even_when_the_responses_own_cgroup_differs`
+proves the same logical claim without a kernel; this proves the kernel
+side actually delivers the inputs that logic needs).
+
+## FQDN enforcement
+
+### Name-rule pattern registration and wildcard semantics
+
+`daemon::compile::compile_policy` now treats a well-formed `type: "name"`
+rule as ACTIVE, not inert (chunk #9 shipped it universally inert, since
+`enforce_fqdn` did not exist yet): every such rule becomes a
+`CompiledNamePattern` (pattern, action, port, proto), and
+`daemon::apply::apply_policy` registers the whole set into
+`crate::dns::patterns::NamePatternStore`, keyed by `cgroup_id`, wholesale
+REPLACING that container's entire prior pattern set (a `policy` snapshot
+is a full replacement, never a delta, matching every other part of this
+protocol). A name rule carrying an unrecognized field inside its matcher
+is still the one ignore-unknown carve-out (`docs/PROTOCOL.md` section 4)
+and remains inert-and-counted exactly as before.
+
+Wildcard semantics (`crate::dns::patterns::pattern_matches`): `*.example.com`
+matches ANY name ending in `.example.com` with at least one more label in
+front of it -- `docs.example.com` AND `raw.objects.example.com` both
+match (multi-label, not the narrower single-label convention a TLS
+wildcard certificate uses), matching Cilium's `toFQDNs` `matchPattern`
+glob semantics. A wildcard never matches its own bare apex (`*.example.com`
+does not match `example.com` itself); an operator wanting both writes two
+rules, matching every DNS-snooping tool `prior_art_fqdn.md` surveyed.
+
+### Resolved-IP insertion into the allow-map
+
+`daemon::fqdn::on_dns_answer` is the hook `crate::dns::capture_callback`
+invokes for every `AttributedAnswer` (i.e., after correlation has already
+run): it checks `NamePatternStore::first_matching_allow` for the
+answer's CORRECTLY-ATTRIBUTED `cgroup_id`, and on a match, inserts the
+resolved address into `POLICY` as a host route
+(`prefix_bits_over_addr = 128`, `source: RuleSource::Dns`), with
+`expires_at_ns` computed by the SAME `crate::dns::cache::expiry_ns(now,
+ttl_secs)` helper `DomainCache::record` uses internally -- the enrichment
+cache and the enforcement allow-map agree on one absolute expiry instant
+by construction, never two independently-derived ones. A pattern with no
+port/proto constraint sets the host route's `cidr_default_action: Allow`
+(the address is fully open); a pattern WITH a port/proto constraint sets
+`cidr_default_action: Deny` plus exactly one `PortRule` granting `Allow`
+for that port/proto -- so `github.com:443/tcp` never accidentally opens
+other ports/protocols to whatever address `github.com` resolves to, even
+though the inserted host route is the single most-specific entry an
+`LpmTrie` lookup will ever find for that exact address (there is no
+"falls through to a broader CIDR" once a `/128` entry exists for that
+address). Only the FIRST matching pattern is used when a name matches more
+than one registered pattern for the same container -- a documented v1
+simplification (no cross-pattern port/proto merging), acceptable because
+the common case is one name rule per domain of interest.
+
+### The reaper: DNS-derived host routes expire and get swept
+
+`probe::policy::PolicyStore::reap_expired` (chunk #4/5) already existed
+but was never called by anything before this chunk -- a real gap, since
+without it, an expired host route would sit in the trie forever, shadowing
+whatever broader, still-valid CIDR entry sits beneath it
+(`bathyscaphe_common::policy`'s own documented "expiry lookup limitation").
+`daemon::stats::tick` now calls `ProbeApi::reap_expired_policy(now_boottime_ns)`
+at the top of every periodic `stats` tick (the same cadence `stats_interval_s`
+already drives), reaping every expired `POLICY` entry across every
+container, DNS-sourced or not.
+
+### Make-before-break must never evict a DNS-sourced route
+
+A latent correctness issue surfaced while wiring this up: `daemon::apply`'s
+make-before-break diff (chunk #7) computed its "old keys to remove" set
+from `ProbeApi::tracked_policy_keys` -- ALL tracked keys for a container,
+regardless of source. Once `on_dns_answer` starts inserting DNS-derived
+host routes into the SAME per-container key pool a static `policy`
+snapshot's entries live in, a later static re-push (one that doesn't
+happen to mention a given resolved address) would have silently REMOVED
+that DNS-derived entry, even though nothing about it had actually
+expired -- directly contradicting `bathy_build_spec.md`'s ratified stance
+that "the DNS-snoop layer is additive" to static policy. Fixed by
+splitting `PolicyStore::container_keys` to track each key's `RuleSource`
+alongside it, and adding `tracked_keys_by_source`/
+`ProbeApi::tracked_policy_keys_by_source`: `apply::apply_make_before_break`
+now diffs only the STATIC subset, leaving any DNS-sourced entry alone
+regardless of what a later static snapshot does or doesn't mention. A
+DNS-derived entry's only two exits are its own TTL (the reaper) or an
+explicit `release`/`release_all` for its container.
+
+### The evolved loud record: `policy.name_unresolved_block`
+
+Chunk #9's `policy.unenforceable_name` reason meant "this build cannot
+evaluate name rules at all" -- no longer true once `enforce_fqdn` is
+always advertised, so this build never emits that reason (it stays
+reserved in `bathyscaphe-proto` for a hypothetical build without the
+capability). The analogous but materially different chunk #10 condition:
+a container holds an active `Allow` name rule, but a connection was
+DENIED to a destination this build never observed a DNS answer for at
+all -- raw-IP egress bypassing DNS entirely, or a DoH/DoT/ECH lookup this
+build structurally cannot see. `daemon::fqdn::NameUnresolvedBlockWatcher`
+(an `EventSink` wrapper composed into the same sink chain
+`daemon::stats::CountingSink` already sits in) watches every mapped
+`Event` for exactly this shape (`verdict: deny` AND `domain.name: null`
+AND the container has at least one active `Allow` name pattern
+registered) and fires a throttled `security` record,
+`reason: policy.name_unresolved_block`, `severity: Error`, carrying
+`dst.addr`/`dst.port` as attributes (deliberately no `domain`, since the
+whole point is that none was ever seen).
+
+**Honest imprecision in this heuristic**: there is no kernel-side signal
+distinguishing "denied because no name rule ever resolved this exact IP"
+from "denied by an unrelated, explicit CIDR deny rule that has nothing to
+do with the container's name rules" -- both collapse to the identical
+`(verdict: deny, domain: null)` shape this watcher keys on. A container
+running both a name-rule allowlist AND an explicit CIDR blocklist will see
+this record fire on denies from either source. Distinguishing them
+precisely would need the kernel to tag WHY a destination fell through to
+default-deny (name-rule-intended vs. never-considered), a materially
+larger change this chunk does not make -- documented here as a residual
+limitation, not silently assumed away.
+
+### The `enforce_fqdn` capability
+
+`daemon::hello::capabilities()` now unconditionally includes
+`Capability::EnforceFqdn` alongside `DnsEnrich`/`Enforce`/`EnforceUdp`/
+`Observe`. Per `docs/PROTOCOL.md` section 2, this means a `policy`
+directive's `type: "name"` rules are no longer at risk of the sticky
+"requested a capability this build doesn't have" validation error --
+airlock can rely on them being genuinely enforced.
+
+## Full residual limitation list (chunks #9 + #10, honest and complete)
+
+IP/CIDR policy is the ground-truth floor throughout; every limitation
+below describes when FQDN enforcement's best-effort layer has nothing to
+add, never a case where IP/CIDR enforcement itself is compromised.
+
+- **DoH/DoT/ECH**: structurally invisible to both `dns_snoop` and
+  `dns_query_snoop` (neither touches port 443/853 traffic) -- a name rule
+  targeting a domain resolved exclusively via one of these never gets any
+  IP inserted into the allow-map, and (per the loud-record section above)
+  a subsequent connection to that domain's actual IP is denied loudly if
+  no other policy permits it.
+- **TCP DNS**: both the query snoop and the response snoop match
+  `IPPROTO_UDP` only; a query/response pair that falls back to TCP:53
+  (large/truncated messages, or a resolver that prefers TCP outright) is
+  invisible to correlation and to caching alike. Documented as a gap in
+  chunk #9 already; chunk #10 does not close it for the query side either.
+- **IPv6 extension headers**: both snoop programs assume UDP is the IPv6
+  fixed header's immediate next header (chunk #9's original gap,
+  unchanged by chunk #10).
+- **Uncorrelatable responses fall back to the response hook's own
+  cgroup_id, low-confidence**: documented above (`AttributedAnswer::correlated`);
+  the cache and enforcement pipeline still function, using the same
+  attribution chunk #9 shipped.
+- **The correlation key omits a resolver-address component**: `(txid,
+  port)` only, not `(txid, port, resolver_addr)` -- see
+  `bathyscaphe::dns::pending`'s module doc for the judged-acceptable
+  collision risk this accepts (an ephemeral-port collision between two
+  DIFFERENT containers' concurrent queries, within the same 5-second
+  window, with the same 16-bit transaction id) in exchange for not
+  needing to plumb an extra field through `DnsCapture`.
+- **The Docker-embedded-DNS address special-case is Docker-specific**:
+  `dns_query_snoop` recognizes `127.0.0.11` by address as a NAT-invariant
+  signal (see the empirical-investigation section above). A different
+  container runtime's own embedded resolver, reached through a similar
+  local-DNAT scheme but a different well-known address, would need its
+  own address added to be recognized the same way -- not automatically
+  covered.
+- **Only the FIRST matching name pattern drives an insertion**: a name
+  matching more than one registered pattern for a container uses
+  whichever pattern compiled first; their port/proto constraints are never
+  merged.
+- **A `deny`-action name rule is registered but not actively enforced**:
+  `NamePatternStore` accepts and stores it (never silently dropped or
+  miscounted as inert), but nothing in this chunk inserts a corresponding
+  DENY entry anywhere -- enforcing a name-based deny would need to block
+  the resolved IP HARDER than whatever broader policy already says, which
+  this chunk's insertion path does not attempt. Deferred.
+- **`policy.name_unresolved_block`'s heuristic imprecision**: documented
+  in its own section above -- it can fire on an unrelated CIDR-policy
+  deny, not exclusively on a genuinely name-rule-intended one.
+- **Spoofing**: unchanged from chunk #9 -- `dns_snoop` trusts any
+  UDP:53-sourced datagram with no trusted-resolver allowlist. This matters
+  MORE now that chunk #10 actually inserts allow-map entries from what it
+  observes: a process able to inject a spoofed UDP:53 response into the
+  same netns could, if it also managed to have a matching query recorded
+  in the pending table (or land as an uncorrelated fallback), cause an
+  unintended IP to be added to a container's allow-map. Revisiting a
+  trusted-resolver restriction remains the documented, not-yet-taken next
+  step chunk #9 already flagged.

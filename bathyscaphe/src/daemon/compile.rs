@@ -72,18 +72,27 @@ pub struct CompiledEntry {
     pub value: PolicyValue,
 }
 
-/// One `type: "name"` rule found active while this snapshot's `mode` is
-/// `block` and `default` is `deny` -- the ratified unenforceable-name
-/// condition (`bathy_build_spec.md`'s NAME-RULE RESOLUTION section): this
-/// build cannot evaluate the name, so the traffic it would have covered
-/// fails CLOSED (falls through to the container's `deny` default), and
-/// that must be LOUD, not silent. [`super::apply`] turns each hit into a
-/// `bathyscaphe_proto::security::SecurityRecord` once it has the
-/// container's name/image to attach.
+/// One well-formed `type: "name"` rule compiled from a `policy` snapshot
+/// (build chunk #10: `enforce_fqdn` is always advertised by this build, so
+/// a name rule is now ACTIVE rather than universally inert -- see
+/// `docs/PROTOCOL.md` section 4 and `docs/DNS.md`). [`super::apply`]
+/// registers the whole `Vec` for a container's `cgroup_id` into
+/// `crate::dns::NamePatternStore`, replacing that container's entire prior
+/// pattern set (a `policy` snapshot is a full replacement, never a delta --
+/// `docs/PROTOCOL.md` section 4). Matching semantics (exact vs. `*.`
+/// wildcard) live in `crate::dns::patterns`, not here -- this struct is
+/// pure data.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnenforceableNameHit {
+pub struct CompiledNamePattern {
     pub rule_id: String,
+    /// Normalized (lowercased, trailing dot stripped) at compile time so
+    /// every consumer (`crate::dns::patterns::pattern_matches`) compares
+    /// against the same shape `crate::dns::parse::parse_dns_response`
+    /// already normalizes a real DNS answer's name to.
     pub pattern: String,
+    pub action: bathyscaphe_common::RuleAction,
+    pub port: Option<u16>,
+    pub proto: Option<bathyscaphe_common::TransportProto>,
 }
 
 /// The compiled form of one `policy` directive, everything
@@ -95,14 +104,16 @@ pub struct CompiledPolicy {
     pub mode: Mode,
     pub default: DefaultVerdict,
     pub entries: Vec<CompiledEntry>,
-    /// `type: "name"` rules, `type` values this build has never heard of,
-    /// and rules carrying an unrecognized field inside a known matcher --
-    /// summed exactly as `Match::is_inert()` plus this build's own
-    /// "name rules are inert" policy (name matchers are never enforced by
-    /// this build regardless of `is_inert()`'s structural answer, since
-    /// `enforce_fqdn` does not exist yet).
+    /// `type` values this build has never heard of, and rules (of any
+    /// type, cidr or name) carrying an unrecognized field inside a known
+    /// matcher -- exactly `Match::is_inert()` summed across the snapshot's
+    /// rules. Build chunk #10: a well-formed `type: "name"` rule no longer
+    /// counts here at all -- it is ACTIVE (see [`CompiledNamePattern`]),
+    /// not inert, since this build always advertises `enforce_fqdn`.
     pub inert_rules: u32,
-    pub unenforceable_name_hits: Vec<UnenforceableNameHit>,
+    /// Every well-formed `type: "name"` rule from this snapshot, active
+    /// under `enforce_fqdn`. See [`CompiledNamePattern`]'s doc.
+    pub name_patterns: Vec<CompiledNamePattern>,
 }
 
 /// A directive that cannot be represented at all: today, exactly "one
@@ -134,18 +145,37 @@ fn convert_default(d: bathyscaphe_proto::DefaultVerdict) -> DefaultVerdict {
     }
 }
 
-fn convert_action_raw(a: bathyscaphe_proto::RuleAction) -> u8 {
+fn convert_action(a: bathyscaphe_proto::RuleAction) -> bathyscaphe_common::RuleAction {
     match a {
-        bathyscaphe_proto::RuleAction::Allow => bathyscaphe_common::RuleAction::Allow as u8,
-        bathyscaphe_proto::RuleAction::Deny => bathyscaphe_common::RuleAction::Deny as u8,
+        bathyscaphe_proto::RuleAction::Allow => bathyscaphe_common::RuleAction::Allow,
+        bathyscaphe_proto::RuleAction::Deny => bathyscaphe_common::RuleAction::Deny,
+    }
+}
+
+fn convert_action_raw(a: bathyscaphe_proto::RuleAction) -> u8 {
+    convert_action(a) as u8
+}
+
+fn convert_transport(p: bathyscaphe_proto::TransportProto) -> bathyscaphe_common::TransportProto {
+    match p {
+        bathyscaphe_proto::TransportProto::Tcp => bathyscaphe_common::TransportProto::Tcp,
+        bathyscaphe_proto::TransportProto::Udp => bathyscaphe_common::TransportProto::Udp,
     }
 }
 
 fn convert_transport_raw(p: bathyscaphe_proto::TransportProto) -> u8 {
-    match p {
-        bathyscaphe_proto::TransportProto::Tcp => bathyscaphe_common::TransportProto::Tcp as u8,
-        bathyscaphe_proto::TransportProto::Udp => bathyscaphe_common::TransportProto::Udp as u8,
-    }
+    convert_transport(p) as u8
+}
+
+/// Normalizes a wire `Match::Name.pattern` (or any DNS name) to the same
+/// lowercase, no-trailing-dot shape `crate::dns::parse::parse_dns_response`
+/// produces for a real answer's name, so pattern registration and
+/// answer-side matching always compare like-for-like. Duplicated (rather
+/// than depended on) here for the same "compile.rs stays free of anything
+/// beyond `bathyscaphe_common`/`bathyscaphe_proto`" boundary this module's
+/// doc already keeps for `addr_to_rfc4291`.
+fn normalize_name(raw: &str) -> String {
+    raw.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Parses a wire `Match::Cidr.cidr` string into `(base address,
@@ -240,15 +270,19 @@ pub fn compile_policy(policy: &Policy, resolve_expiry: impl Fn(&str) -> Option<u
 
     let mut groups: BTreeMap<(u32, [u8; 16]), Group> = BTreeMap::new();
     let mut inert_rules = 0u32;
-    let mut unenforceable_name_hits = Vec::new();
+    let mut name_patterns = Vec::new();
 
     for rule in &policy.rules {
         match &rule.r#match {
-            Match::Name { pattern, .. } => {
+            Match::Name { unknown, .. } if !unknown.is_empty() => {
+                // An unrecognized field inside a `type: "name"` matcher --
+                // the same inert-and-counted carve-out `Match::Cidr` gets
+                // below, per `docs/PROTOCOL.md` section 4's "the one
+                // ignore-unknown carve-out".
                 inert_rules += 1;
-                if mode == Mode::Block && default == DefaultVerdict::Deny {
-                    unenforceable_name_hits.push(UnenforceableNameHit { rule_id: rule.id.clone(), pattern: pattern.clone() });
-                }
+            }
+            Match::Name { pattern, port, proto, .. } => {
+                name_patterns.push(CompiledNamePattern { rule_id: rule.id.clone(), pattern: normalize_name(pattern), action: convert_action(rule.action), port: *port, proto: proto.map(convert_transport) });
             }
             Match::Unknown => {
                 inert_rules += 1;
@@ -314,7 +348,7 @@ pub fn compile_policy(policy: &Policy, resolve_expiry: impl Fn(&str) -> Option<u
         entries.push(CompiledEntry { addr: unmap_addr(addr_bytes), prefix_bits_over_addr, value });
     }
 
-    Ok(CompiledPolicy { generation: policy.generation, mode, default, entries, inert_rules, unenforceable_name_hits })
+    Ok(CompiledPolicy { generation: policy.generation, mode, default, entries, inert_rules, name_patterns })
 }
 
 #[cfg(test)]
@@ -413,37 +447,61 @@ mod tests {
     }
 
     #[test]
-    fn name_rule_is_inert_and_counted() {
+    fn a_well_formed_name_rule_is_active_not_inert() {
+        // Build chunk #10: enforce_fqdn is always advertised, so a
+        // well-formed name rule is no longer counted as inert -- it
+        // becomes a registered CompiledNamePattern instead.
         let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![name_rule("r1", "*.example.com", WireAction::Allow)]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
-        assert_eq!(compiled.inert_rules, 1);
-        // Baseline entry only -- the name rule contributes no policy entry.
+        assert_eq!(compiled.inert_rules, 0);
+        assert_eq!(compiled.name_patterns.len(), 1);
+        assert_eq!(compiled.name_patterns[0].rule_id, "r1");
+        assert_eq!(compiled.name_patterns[0].pattern, "*.example.com");
+        assert_eq!(compiled.name_patterns[0].action, bathyscaphe_common::RuleAction::Allow);
+        // Baseline entry only -- a name rule contributes no POLICY entry of
+        // its own; only a subsequent DNS answer match does that.
         assert_eq!(compiled.entries.len(), 1);
     }
 
     #[test]
-    fn name_rule_in_block_deny_mode_emits_an_unenforceable_name_hit() {
-        let policy = base_policy(WireMode::Block, WireDefault::Deny, vec![name_rule("r-gh-name", "github.com", WireAction::Allow)]);
+    fn a_name_rule_pattern_is_normalized_to_lowercase_with_no_trailing_dot() {
+        let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![name_rule("r1", "GitHub.COM.", WireAction::Allow)]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
-        assert_eq!(compiled.unenforceable_name_hits.len(), 1);
-        assert_eq!(compiled.unenforceable_name_hits[0].rule_id, "r-gh-name");
-        assert_eq!(compiled.unenforceable_name_hits[0].pattern, "github.com");
+        assert_eq!(compiled.name_patterns[0].pattern, "github.com");
     }
 
     #[test]
-    fn name_rule_outside_block_deny_mode_is_inert_but_quiet() {
-        // audit/alert modes, or block-mode-with-default-allow, never
-        // silently drop traffic on an unenforceable name (nothing is
-        // enforced at all in those modes/postures), so no loud record is
-        // warranted -- only the block+deny combination fails traffic
-        // closed on an unresolvable name.
-        let policy = base_policy(WireMode::Alert, WireDefault::Deny, vec![name_rule("r1", "github.com", WireAction::Allow)]);
+    fn a_name_rule_carries_its_port_and_proto_constraint_through() {
+        let mut rule = name_rule("r1", "github.com", WireAction::Allow);
+        rule.r#match = Match::Name { pattern: "github.com".to_string(), port: Some(443), proto: Some(WireProto::Tcp), unknown: Default::default() };
+        let policy = base_policy(WireMode::Block, WireDefault::Deny, vec![rule]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
-        assert!(compiled.unenforceable_name_hits.is_empty());
+        assert_eq!(compiled.name_patterns[0].port, Some(443));
+        assert_eq!(compiled.name_patterns[0].proto, Some(bathyscaphe_common::TransportProto::Tcp));
+    }
 
-        let policy = base_policy(WireMode::Block, WireDefault::Allow, vec![name_rule("r2", "github.com", WireAction::Allow)]);
+    #[test]
+    fn a_name_rule_with_an_unrecognized_field_is_still_inert_and_counted() {
+        let mut unknown = serde_json::Map::new();
+        unknown.insert("weird_field".to_string(), serde_json::Value::Bool(true));
+        let rule = Rule { id: "r1".to_string(), action: WireAction::Allow, r#match: Match::Name { pattern: "github.com".to_string(), port: None, proto: None, unknown }, expires_at: None, source: WireSource::Static };
+        let policy = base_policy(WireMode::Alert, WireDefault::Allow, vec![rule]);
         let compiled = compile_policy(&policy, no_expiry).expect("compiles");
-        assert!(compiled.unenforceable_name_hits.is_empty());
+        assert_eq!(compiled.inert_rules, 1, "an unrecognized field inside a name matcher is still the one ignore-unknown carve-out");
+        assert!(compiled.name_patterns.is_empty(), "a rule marked inert must not also register an active pattern");
+    }
+
+    #[test]
+    fn a_deny_name_rule_is_still_registered_as_a_pattern() {
+        // A `deny` name rule is accepted onto the snapshot like any other
+        // (this build does not actively ENFORCE a name-based deny -- see
+        // docs/DNS.md's residual limitations -- but it must not be
+        // silently discarded or miscounted as inert either).
+        let policy = base_policy(WireMode::Block, WireDefault::Deny, vec![name_rule("r1", "evil.example.com", WireAction::Deny)]);
+        let compiled = compile_policy(&policy, no_expiry).expect("compiles");
+        assert_eq!(compiled.name_patterns.len(), 1);
+        assert_eq!(compiled.name_patterns[0].action, bathyscaphe_common::RuleAction::Deny);
+        assert_eq!(compiled.inert_rules, 0);
     }
 
     #[test]

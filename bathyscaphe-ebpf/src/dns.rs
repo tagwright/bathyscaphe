@@ -213,6 +213,16 @@ fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize) -> Result<(), 
         return Ok(());
     }
 
+    // The response's own UDP destination port (bytes 2-3 of the UDP
+    // header): the querying process's ephemeral source port, which the
+    // resolver addresses its reply back to. Build chunk #10's userspace
+    // query/response correlation (`bathyscaphe::dns::pending`) matches
+    // this against a captured query's `src_port` to recover the correct
+    // querying container's cgroup id when `cgroup_id` below is wrong (see
+    // `bathyscaphe_common::dns::DnsCapture::dst_port`'s doc).
+    let dst_port_bytes: [u8; 2] = ctx.load(l4_offset + 2)?;
+    let dst_port = u16::from_be_bytes(dst_port_bytes);
+
     // The UDP header's own `length` field (bytes 4-5, header+payload,
     // network byte order): trusted here purely to learn how many of the
     // captured bytes are real payload versus tier-padding "garbage" past
@@ -240,6 +250,7 @@ fn capture_if_dns_response(ctx: &SkBuffContext, l4_offset: usize) -> Result<(), 
     // -- exactly `init_at`'s precondition.
     unsafe {
         DnsCapture::init_at(ptr, cgroup_id, ktime_ns);
+        (*ptr).dst_port = dst_port;
     }
 
     // Tiered fixed-size loads, largest first: each `bpf_skb_load_bytes`

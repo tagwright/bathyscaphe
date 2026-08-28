@@ -72,6 +72,7 @@
 
 pub mod apply;
 pub mod compile;
+pub mod fqdn;
 pub mod hello;
 pub mod probe_api;
 pub mod r2;
@@ -96,10 +97,11 @@ use bathyscaphe_proto::down::DownMessage;
 use bathyscaphe_proto::UpMessage;
 
 use crate::attribution::{Attributor, AttributionService};
-use crate::dns::DomainCache;
+use crate::dns::{DomainCache, NamePatternStore, PendingQueryTable};
 use crate::pipeline::{EventSink, Pipeline};
-use crate::probe::{DnsCaptureConsumer, EventConsumer, Probe};
+use crate::probe::{DnsCaptureConsumer, DnsQueryCaptureConsumer, EventConsumer, Probe};
 
+use fqdn::NameUnresolvedBlockWatcher;
 use probe_api::ProbeApi;
 pub use r2::DropEscalationConfig;
 use security::SecurityEmitter;
@@ -187,6 +189,7 @@ impl Daemon {
 
         let ring = probe.take_events().context("the probe's ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)")?;
         let dns_ring = probe.take_dns_events().context("the probe's DNS ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)")?;
+        let dns_query_ring = probe.take_dns_queries().context("the probe's DNS query ring buffer was already taken (this should never happen on a freshly loaded/reopened probe)")?;
         let boot_offset_ns = sample_boot_offset_ns()?;
 
         let (tx, rx) = mpsc::channel::<UpMessage>();
@@ -218,16 +221,29 @@ impl Daemon {
         let shared_state = Arc::new(Mutex::new(DaemonState::new()));
         let security = Arc::new(SecurityEmitter::new());
         let domain_cache = Arc::new(Mutex::new(DomainCache::new()));
+        // Build chunk #10: the query/response correlation table and the
+        // per-container FQDN name-rule pattern registry, both shared
+        // between the directive loop (writer of `name_rules`, via
+        // `apply::apply_policy`/`apply_release`), the DNS query consumer
+        // (writer of `pending`), the DNS answer consumer (reader of both,
+        // via `crate::dns::capture_callback`'s correlation and
+        // `fqdn::on_dns_answer`'s pattern match), and the event pipeline's
+        // sink chain (reader of `name_rules`, via
+        // `fqdn::NameUnresolvedBlockWatcher`).
+        let pending = Arc::new(Mutex::new(PendingQueryTable::new()));
+        let name_rules = Arc::new(Mutex::new(NamePatternStore::new()));
 
         let (counting_sink, events_emitted, denies_since_last) = stats::CountingSink::new(tx.clone());
-        let pipeline = Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), counting_sink).context("failed to construct the event pipeline")?;
+        let name_watch_sink = NameUnresolvedBlockWatcher::new(counting_sink, Arc::clone(&shared_state), Arc::clone(&name_rules), Arc::clone(&security));
+        let pipeline = Pipeline::new(Arc::clone(&resolver), Arc::clone(&shared_probe), Arc::clone(&domain_cache), name_watch_sink).context("failed to construct the event pipeline")?;
         let consumer = EventConsumer::spawn(ring, pipeline.into_callback());
-        let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, crate::dns::capture_callback(Arc::clone(&domain_cache)));
+        let dns_query_consumer = DnsQueryCaptureConsumer::spawn(dns_query_ring, crate::dns::query_capture_callback(Arc::clone(&pending)));
+        let dns_consumer = DnsCaptureConsumer::spawn(dns_ring, dns_answer_callback(Arc::clone(&domain_cache), Arc::clone(&pending), Arc::clone(&shared_probe), Arc::clone(&name_rules)));
 
         let stats_shutdown = Arc::new(AtomicBool::new(false));
         let stats_handle = spawn_stats_thread(Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&security), tx.clone(), Arc::clone(&stats_shutdown), events_emitted, denies_since_last, config.r2, stats_interval_s);
 
-        let outcome = run_directive_loop(stdin.lock(), Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&security), tx.clone(), boot_offset_ns);
+        let outcome = run_directive_loop(stdin.lock(), Arc::clone(&shared_probe), Arc::clone(&shared_state), Arc::clone(&resolver), Arc::clone(&name_rules), tx.clone(), boot_offset_ns);
 
         // Shutdown, in dependency order. Deliberately no probe mutation
         // anywhere in this sequence -- see the module doc.
@@ -235,12 +251,26 @@ impl Daemon {
         let _ = stats_handle.join();
         consumer.stop();
         dns_consumer.stop();
+        dns_query_consumer.stop();
         attribution.stop();
         drop(tx);
         let _ = stdout_handle.join();
 
         Ok(outcome.into())
     }
+}
+
+/// Builds the `DNS_EVENTS` (answer) ring-buffer callback for [`Daemon::run`]:
+/// `crate::dns::capture_callback`'s cache-recording + correlation, plus a
+/// `daemon::fqdn::on_dns_answer` hook that locks `shared_probe` only for
+/// the (rare, DNS-cadence, not connect-cadence) duration of one potential
+/// `POLICY` insert -- kept as its own named function rather than an inline
+/// closure purely so this file's `run` body stays readable.
+fn dns_answer_callback(domain_cache: Arc<Mutex<DomainCache>>, pending: Arc<Mutex<PendingQueryTable>>, shared_probe: Arc<Mutex<Probe>>, name_rules: Arc<Mutex<NamePatternStore>>) -> crate::probe::DnsCallback {
+    crate::dns::capture_callback(domain_cache, pending, move |answer| {
+        let mut probe = shared_probe.lock().unwrap_or_else(|poison| poison.into_inner());
+        fqdn::on_dns_answer(&mut *probe as &mut dyn ProbeApi, &name_rules, &answer);
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -278,7 +308,13 @@ fn spawn_stats_thread(
             let stats_message = {
                 let mut probe_guard = shared_probe.lock().unwrap_or_else(|poison| poison.into_inner());
                 let mut state_guard = shared_state.lock().unwrap_or_else(|poison| poison.into_inner());
-                stats::tick(&mut runtime, &mut *probe_guard, &mut *state_guard, resolver.as_ref(), &security, &mut sink, &r2_config, stats_interval_s)
+                // Build chunk #10: the same tick that already holds the
+                // probe lock is where the POLICY TTL reaper runs (a
+                // DNS-derived host route's, or any other TTL-bearing
+                // entry's, expiry) -- see `probe::policy::PolicyStore::reap_expired`'s
+                // doc for why prompt reaping matters beyond simple cleanup.
+                let now_boottime_ns = crate::probe::clock::now_boottime_ns().unwrap_or(0);
+                stats::tick(&mut runtime, &mut *probe_guard, &mut *state_guard, resolver.as_ref(), &security, &mut sink, &r2_config, stats_interval_s, now_boottime_ns)
             };
             sink.emit(UpMessage::Stats(stats_message));
         }
@@ -287,7 +323,7 @@ fn spawn_stats_thread(
 
 /// Runs the stdin directive loop on the calling (main) thread, dispatching
 /// every non-`shutdown` directive against the shared probe/state.
-fn run_directive_loop(stdin_lock: std::io::StdinLock<'_>, shared_probe: Arc<Mutex<Probe>>, shared_state: Arc<Mutex<DaemonState>>, resolver: Arc<crate::attribution::Resolver>, security: Arc<SecurityEmitter>, sink: mpsc::Sender<UpMessage>, boot_offset_ns: i128) -> stdin::StdinOutcome {
+fn run_directive_loop(stdin_lock: std::io::StdinLock<'_>, shared_probe: Arc<Mutex<Probe>>, shared_state: Arc<Mutex<DaemonState>>, resolver: Arc<crate::attribution::Resolver>, name_rules: Arc<Mutex<NamePatternStore>>, sink: mpsc::Sender<UpMessage>, boot_offset_ns: i128) -> stdin::StdinOutcome {
     let mut sink = sink;
     stdin::run(stdin_lock, move |message| {
         let mut probe_guard = shared_probe.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -298,15 +334,15 @@ fn run_directive_loop(stdin_lock: std::io::StdinLock<'_>, shared_probe: Arc<Mute
                 eprintln!("bathyscaphe: unexpected second `start` directive after the handshake; ignoring");
             }
             DownMessage::Policy(policy) => {
-                let ack = apply::apply_policy(&mut *probe_guard, &mut *state_guard, resolver.as_ref(), resolver.as_ref(), &security, &mut sink, boot_offset_ns, &policy);
+                let ack = apply::apply_policy(&mut *probe_guard, &mut *state_guard, resolver.as_ref(), &name_rules, boot_offset_ns, &policy);
                 sink.emit(UpMessage::PolicyAck(ack));
             }
             DownMessage::Release(release) => {
-                let ack = apply::apply_release(&mut *probe_guard, &mut *state_guard, resolver.as_ref(), &release.container_id);
+                let ack = apply::apply_release(&mut *probe_guard, &mut *state_guard, resolver.as_ref(), &name_rules, &release.container_id);
                 sink.emit(UpMessage::ReleaseAck(ack));
             }
             DownMessage::ReleaseAll(_) => {
-                for ack in apply::apply_release_all(&mut *probe_guard, &mut *state_guard) {
+                for ack in apply::apply_release_all(&mut *probe_guard, &mut *state_guard, &name_rules) {
                     sink.emit(UpMessage::ReleaseAck(ack));
                 }
             }

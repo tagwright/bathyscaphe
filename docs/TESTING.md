@@ -420,3 +420,223 @@ removed after each run (the test removes its own container/network as
 part of its own teardown in addition to the outer container removal).
 Confirmed absent via `docker ps -a` / `docker network ls` after the final
 run.
+
+## What chunk #10 (query/response correlation + FQDN enforcement) proved
+
+### Unprivileged, no kernel/bpffs/cgroup access required
+
+`cargo test` inside the same `rust:1-bookworm` toolchain container:
+
+- `bathyscaphe_common::dns` -- `DnsCapture` gained a `dst_port` field with
+  the struct's pinned size UNCHANGED (536 bytes, `_pad` shrunk from 6 to 4
+  bytes to make room); `DnsQueryCapture`'s own pinned size (24 bytes) and
+  alignment, and its trivial by-value constructor (small enough to skip
+  `DnsCapture::init_at`'s raw-pointer pattern entirely).
+- `probe::dns_query` -- ring-buffer record decode round-trips a
+  well-formed `DnsQueryCapture` and rejects a short/oversized buffer,
+  mirroring `probe::dns`'s tests exactly.
+- `dns::pending` -- `PendingQueryTable`: a fresh query correlates its
+  response; wrong txid, wrong port, and past-TTL responses all miss;
+  a response exactly at the TTL boundary still correlates; multiple
+  responses to one query all correlate (no removal-on-first-match); the
+  table sweeps aged-out entries on every write. The key scenario:
+  `correlation_recovers_the_querying_containers_cgroup_even_when_the_responses_own_cgroup_differs`
+  simulates the Docker-embedded-DNS case directly (a query recorded under
+  a "container" cgroup id, a response's own cgroup id set to a
+  DIFFERENT, "docker.service"-standing-in value) and asserts correlation
+  returns the CORRECT (container's) id, not the response's own -- the
+  precise logical claim the privileged live smoke test below re-proves
+  against a real kernel.
+- `dns::patterns` -- `NamePatternStore`/`pattern_matches`: exact-name
+  match, wildcard multi-label match (`*.github.com` matching BOTH
+  `docs.github.com` and `raw.objects.github.com`), a wildcard never
+  matching its own bare apex, an unrelated-suffix non-match, a
+  bare-wildcard-with-no-suffix matching nothing, full-snapshot
+  replacement semantics, per-container isolation, and that a `deny`
+  pattern is stored but never returned by `first_matching_allow`.
+- `dns::mod` -- `capture_callback`'s correlation wiring: a captured
+  response with the WRONG `cgroup_id` of its own gets attributed to the
+  CORRELATED (correct) cgroup id when a matching query was recorded
+  first (proving the whole `dns_snoop` capture -> correlate -> cache
+  pipeline, not just the table in isolation), and falls back to the
+  capture's own `cgroup_id` (with `correlated: false`) when no query
+  ever matched. `query_capture_callback` feeds the pending table
+  correctly.
+- `daemon::compile` -- a well-formed `type: "name"` rule is now ACTIVE
+  (not inert), carries its port/proto constraint through to the compiled
+  `CompiledNamePattern`, is normalized to lowercase with no trailing dot,
+  and a name rule carrying an unrecognized field is still the one
+  ignore-unknown carve-out (inert and counted). A `deny`-action name rule
+  is registered (not dropped, not miscounted as inert).
+- `daemon::apply` -- `apply_policy` registers a container's compiled name
+  patterns into `NamePatternStore` and reports `inert_rules: 0` for a
+  well-formed name rule; a re-push with NO name rules clears the prior
+  registration wholesale (never leaves a stale pattern behind);
+  `apply_release`/`apply_release_all` clear a container's registered
+  patterns too. The correctness fix:
+  `make_before_break_never_removes_a_dns_sourced_host_route` proves a
+  DNS-derived (`source: Dns`) host route inserted directly against the
+  probe survives a SECOND static `policy` re-push that mentions neither
+  it nor the static rule that originally shared its container -- only the
+  stale STATIC entry is removed, exactly the make-before-break diff fix
+  this chunk made.
+- `daemon::fqdn` -- `on_dns_answer`: inserts an unconstrained host route
+  on a pattern match with no port/proto constraint; does nothing on a
+  non-match; applies a pattern's port/proto constraint as a `PortRule`
+  with `cidr_default_action: Deny` (so only the constrained port/proto is
+  actually open on that specific host route); computes the SAME
+  `expires_at_ns` `DomainCache`'s own formula would for the identical
+  `(ttl_secs, ktime_ns)` pair. `NameUnresolvedBlockWatcher`: fires the
+  throttled `policy.name_unresolved_block` record on a deny with no
+  domain enrichment when the container has an active allow name pattern;
+  stays quiet when the deny DID carry domain enrichment (a resolved name
+  still denied by policy is not the "unresolved" signal), when the
+  container has no active name rule at all, and on a non-deny verdict.
+- `daemon::hello` -- `capabilities()` now asserts `enforce_fqdn` IS
+  advertised alongside `dns_enrich`, `sni_enrich` still is not.
+- `daemon::security` -- `name_unresolved_block_record` carries `ERROR`
+  severity, the new reason code, and `dst.addr`/`dst.port` attributes with
+  no `domain` attribute (the record's entire point is that none was ever
+  observed); the shared-throttle tests were ported from the retired
+  `unenforceable_name_record` onto the new builder with no change in
+  throttling behavior.
+- `daemon::stats` -- `tick` now takes an explicit `now_boottime_ns` and
+  calls the `POLICY` TTL reaper at the top of every tick;
+  `a_tick_reaps_an_expired_policy_entry` seeds one never-expiring and one
+  short-lived (`RuleSource::Dns`) policy entry, ticks with a synthetic
+  "now" past the short-lived entry's expiry, and asserts only that one
+  entry was removed.
+- `probe::policy` -- `PolicyStore::container_keys` restructured to track
+  each key's `RuleSource` alongside it (a `HashMap<TrackedKey, u8>`
+  rather than a `HashSet<TrackedKey>`); `tracked_keys_by_source` is the
+  new query the make-before-break fix depends on.
+
+226 tests in the `bathyscaphe` binary crate (up from 180), 23 in
+`bathyscaphe-common` (up from 20), 29 in `bathyscaphe-proto` (unchanged --
+no wire shape changed, only a new reason-code string constant), all
+green; 4 tests `#[ignore]`d (the three pre-existing live smokes plus this
+chunk's new one).
+
+### eBPF build: verifier acceptance, and the fixed-size-load reuse from chunk #9
+
+`dns_query_snoop` (the 7th program) needed NONE of chunk #9's tiered
+literal-length `bpf_skb_load_bytes` machinery: every read it performs is a
+small, FIXED-size load at a fixed offset (the IP version nibble, IHL,
+protocol byte, the destination address for the Docker-embedded-DNS
+special case, both UDP ports, and the two-byte DNS transaction id) --
+`SkBuffContext::load::<T>()`'s ordinary safe wrapper handles all of these
+with no computed-length argument anywhere, so the entire class of
+verifier problem chunk #9 fought through never arose here. `DnsQueryCapture`
+(24 bytes) is built by value on the stack and written into its reserved
+`RingBuf` slot with a plain `entry.write(...)`, the same shape
+`bathyscaphe-ebpf::decide::emit_event` already uses for `Event` -- no
+`init_at`-style raw-pointer construction needed, since 24 bytes is
+nowhere near the eBPF stack's 512-byte limit. `readelf -s` on the built
+object confirms both `dns_snoop` and `dns_query_snoop` compile to
+DISTINCT `FUNC` symbols living in the SAME `cgroup/skb` ELF section (aya's
+`#[cgroup_skb]` macro does not encode the attach direction into the
+section name, since direction is chosen at userspace attach time, not
+load time) -- `aya::Ebpf::program_mut("dns_query_snoop")` resolves programs
+by symbol name regardless, so this is a normal, harmless ELF layout
+detail, not a collision.
+
+### Privileged smoke test -- FULL PROOF, precisely
+
+Per the build brief's mandate to attempt this and report precisely, AND
+to investigate the empirical claim rather than assume it.
+
+**Setup**: `bathyscaphe-itest-fqdn-build` (unprivileged, `rust:1-bookworm`,
+`/workspace` bind-mounted): built the workspace per
+`docs/BUILDING.md`. `bathyscaphe-itest-fqdn-priv` (`docker run --privileged
+--cgroupns=host --pid=host`, same image, the same `/workspace` bind
+mount so the already-built test binary could run directly, plus
+`/var/run/docker.sock` bind-mounted, `mount -t bpf bpf /sys/fs/bpf`): host
+kernel 6.8.0-136. `--cgroupns=host` required for the identical reason
+chunk #9's own privileged test documents.
+
+**What ran**: `probe::dns_query::live_smoke::query_response_correlation_recovers_the_correct_container_cgroup`
+(`#[ignore]`d, invoked with `--ignored --test-threads=1`). It creates a
+throwaway user-defined bridge network (`bathyscaphe-itest-fqdn-net`) and
+an `alpine` container (`bathyscaphe-itest-fqdn-smoke`, running `sleep 1 &&
+nslookup example.com; sleep 4`) on it, attaches the real probe (all
+SEVEN programs) to that container's real cgroup, drains BOTH the
+`DNS_QUERIES` and `DNS_EVENTS` rings concurrently for up to 12 seconds,
+then:
+
+1. Asserts every captured QUERY's `cgroup_id` equals the container's own
+   real cgroup id (the foundational claim).
+2. Runs the SAME `PendingQueryTable` production code (not a test-only
+   reimplementation) against the captured queries and answers.
+3. Asserts every captured ANSWER, once correlated, resolves to the
+   container's cgroup id.
+
+**A real, unanticipated finding, investigated and fixed before the proof
+succeeded**: the FIRST run of this test failed with "`dns_query_snoop`
+captured NOTHING at all" -- a genuine capture-logic gap, not a tolerated
+confound (unlike chunk #9's exact-cgroup-match caveat, this one hard-fails
+the test by design). Rather than accept a `#[ignore]`-worthy shrug, this
+was investigated directly: a temporary diagnostic build removed the
+`dst_port == 53` filter entirely and logged every captured egress UDP
+datagram's ports regardless of value. Run three times against fresh
+containers, it showed the query's destination port AT THE EGRESS HOOK was
+a random high port every time (55561, then 55508, then 48204 -- never
+53), while the query's source port exactly matched the following
+response's destination port in every run (proving these really were the
+DNS query/response pair). The cause: Docker's embedded resolver at
+`127.0.0.11` is reached via a per-network-namespace iptables `DNAT` rule
+that rewrites the destination PORT (never the address) to an internal,
+randomly-allocated port before the packet reaches the `cgroup_skb`
+EGRESS hook (which fires after `LOCAL_OUT` netfilter NAT processing) --
+see `bathyscaphe-ebpf::dns_query`'s module doc and `docs/DNS.md` for the
+full account. **Fixed** by matching EITHER port 53 OR a destination
+address of `127.0.0.11` (NAT-invariant, since the DNAT rule only ever
+rewrites the port); re-run after the fix, the test passed cleanly, three
+times in a row (once standalone, twice more alongside every other
+`live_smoke` test in the same invocation, all four green together with no
+interference).
+
+**Result, exactly as printed by the (non-diagnostic) passing run**:
+
+```
+fqdn live_smoke: 2 queries captured; cgroup_ids 000000000005b396 (container's real cgroup is 000000000005b396) -- query_cgroup_matched_container=true
+fqdn live_smoke: answer txid=2868 dst_port=45647 response's own cgroup_id=0000000000002986 (matched container: false) correlated cgroup_id=Some(373654) (matched container: true)
+fqdn live_smoke: answer txid=2869 dst_port=45647 response's own cgroup_id=0000000000002986 (matched container: false) correlated cgroup_id=Some(373654) (matched container: true)
+fqdn live_smoke: FULL PROOF -- egress query snoop correctly attributed to the container's own cgroup in every case; response's OWN cgroup attribution matched the container in zero case(s) (chunk #9's docker.service misattribution reproduced exactly as chunk #9 documented); correlation recovered the correct container cgroup in every case regardless
+```
+
+This decisively proves, without qualification, on a real 6.8.0-136 kernel
+against a real Docker container on a real user-defined network:
+
+- The verifier ACCEPTS all seven programs, `attach_container` succeeds
+  for the full set.
+- The egress query snoop's cgroup attribution is CORRECT in every
+  observed case -- the entire premise the correlation design rests on.
+- The response's OWN cgroup attribution is WRONG in every observed case
+  (`docker.service`'s cgroup, not the container's) -- chunk #9's finding,
+  reproduced on demand.
+- Query/response correlation RECOVERS THE CORRECT CGROUP in every
+  observed case, overriding the response's own wrong attribution.
+
+Also re-run alongside the three PRE-EXISTING privileged live-smoke tests
+(`probe::live_smoke::load_attach_pin_reopen_unpin_round_trip`,
+`probe::dns::live_smoke::dns_snoop_captures_and_parses_a_real_containers_dns_answer`,
+`attribution::resolver::live_smoke::resolves_a_real_container_end_to_end`)
+in one invocation: all four passed together, confirming the new 7th
+program and the `DnsCapture::dst_port` field addition did not regress any
+prior chunk's proven behavior (chunk #9's own test still reports its
+documented PARTIAL proof for the exact-cgroup ingress-only case, unchanged).
+
+**What this does NOT prove** (honestly deferred): a resolver reached over
+a real external NIC path rather than Docker's embedded loopback resolver
+was not exercised on this host (chunk #9 already noted this same gap for
+the response side); TCP-fallback DNS correlation; a second, concurrently
+querying container on the same host (to rule out any cross-container
+`(txid, port)` collision in practice, beyond the theoretical analysis in
+`dns::pending`'s module doc). Deferred to chunk #12's integration suite.
+
+**Cleanup**: `bathyscaphe-itest-fqdn-build` and `bathyscaphe-itest-fqdn-priv`
+were removed after use. The test's own throwaway container
+(`bathyscaphe-itest-fqdn-smoke`) and network (`bathyscaphe-itest-fqdn-net`)
+were removed as part of its own teardown on every run; confirmed absent
+via the Docker API afterward. `/sys/fs/bpf` confirmed empty after the
+final run (the test's own `unpin_all` call).

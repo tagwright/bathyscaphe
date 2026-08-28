@@ -63,6 +63,19 @@ use bathyscaphe_proto::DomainConfidence;
 /// scope choice -- see `docs/DNS.md`.
 pub const STALE_GRACE_NS: u64 = 15 * 60 * 1_000_000_000;
 
+/// Computes the absolute `CLOCK_BOOTTIME` instant a DNS answer's TTL
+/// elapses, from the same `(ttl_secs, now_boottime_ns)` pair every caller
+/// that needs an answer's expiry receives. Factored out of
+/// [`DomainCache::record`] so build chunk #10's FQDN enforcement layer
+/// (`daemon::fqdn::on_dns_answer`) computes the EXACT SAME absolute instant
+/// for a `POLICY` host-route's `expires_at_ns` as this cache computes for
+/// its own enrichment entry -- per `docs/DNS.md`'s plugging-in note, the
+/// enrichment cache and the enforcement allow-map must agree on one
+/// expiry, never derive it twice and risk drift.
+pub fn expiry_ns(now_boottime_ns: u64, ttl_secs: u32) -> u64 {
+    now_boottime_ns.saturating_add(u64::from(ttl_secs).saturating_mul(1_000_000_000))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheEntry {
     domain: String,
@@ -115,7 +128,7 @@ impl DomainCache {
     /// bounded by "however many distinct addresses this one container
     /// ever resolved," not host-wide).
     pub fn record(&mut self, cgroup_id: u64, domain: String, addr: IpAddr, ttl_secs: u32, now_boottime_ns: u64) {
-        let expires_at_ns = now_boottime_ns.saturating_add(u64::from(ttl_secs).saturating_mul(1_000_000_000));
+        let expires_at_ns = expiry_ns(now_boottime_ns, ttl_secs);
         let purge_at_ns = expires_at_ns.saturating_add(STALE_GRACE_NS);
         let container = self.by_container.entry(cgroup_id).or_default();
         container.insert(addr, CacheEntry { domain, expires_at_ns, purge_at_ns });

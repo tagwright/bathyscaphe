@@ -10,15 +10,17 @@ use bathyscaphe_proto::{Capability, Hello, PinnedContainer, PROTO_VERSION};
 
 use super::probe_api::ProbeApi;
 
-/// This build's capability set. `dns_enrich` (build chunk #9) is now
-/// live: `domain.*` on events is populated from snooped DNS answers.
-/// Deliberately does NOT include `enforce_fqdn` (name-rule ENFORCEMENT,
-/// chunk #10) or `sni_enrich` (unbuilt) -- advertising a capability this
-/// build cannot actually honor would make a `policy` sender's
-/// `mode: block` on a name rule a silent downgrade rather than the sticky
-/// validation error `docs/PROTOCOL.md` section 2 calls for.
+/// This build's capability set. `dns_enrich` (build chunk #9) populates
+/// `domain.*` on events from snooped DNS answers. `enforce_fqdn` (build
+/// chunk #10) is now also live: `type: "name"` rules are actively
+/// resolved and enforced (`daemon::compile`/`daemon::fqdn`), not merely
+/// counted inert. Deliberately still does NOT include `sni_enrich`
+/// (unbuilt) -- advertising a capability this build cannot actually honor
+/// would make a `policy` sender's request for it a silent downgrade rather
+/// than the sticky validation error `docs/PROTOCOL.md` section 2 calls
+/// for.
 pub fn capabilities() -> Vec<Capability> {
-    vec![Capability::Observe, Capability::Enforce, Capability::EnforceUdp, Capability::DnsEnrich]
+    vec![Capability::Observe, Capability::Enforce, Capability::EnforceUdp, Capability::DnsEnrich, Capability::EnforceFqdn]
 }
 
 fn mode_to_wire(mode: Mode) -> bathyscaphe_proto::Mode {
@@ -62,13 +64,13 @@ mod tests {
     use std::net::IpAddr;
 
     #[test]
-    fn capabilities_include_dns_enrich_but_not_enforce_fqdn_or_sni_enrich() {
+    fn capabilities_include_dns_enrich_and_enforce_fqdn_but_not_sni_enrich() {
         let caps = capabilities();
         assert!(caps.contains(&Capability::Observe));
         assert!(caps.contains(&Capability::Enforce));
         assert!(caps.contains(&Capability::EnforceUdp));
         assert!(caps.contains(&Capability::DnsEnrich));
-        assert!(!caps.contains(&Capability::EnforceFqdn));
+        assert!(caps.contains(&Capability::EnforceFqdn));
         assert!(!caps.contains(&Capability::SniEnrich));
     }
 

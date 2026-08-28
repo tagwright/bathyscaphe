@@ -23,7 +23,7 @@
 //! `PolicyKeyData::PREFIX_LEN_FULL` above. See `tests::isolation` below for
 //! the property spelled out as an executable proof.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use anyhow::{Context, Result};
@@ -112,7 +112,14 @@ pub fn udp_port_rule(port_lo: u16, port_hi: u16, action: u8) -> PortRule {
 
 /// A stored key's identity, minus the `cgroup_id` (implied by whichever
 /// [`PolicyStore::container_keys`] bucket it lives in). Used only for
-/// userspace bookkeeping -- never crosses into a BPF map.
+/// userspace bookkeeping -- never crosses into a BPF map. Deliberately
+/// carries no `source` field of its own (unlike the `PolicyValue` it was
+/// inserted with): a `HashMap<TrackedKey, u8>` (the raw
+/// `bathyscaphe_common::RuleSource` discriminant) is what
+/// [`PolicyStore::container_keys`] uses instead, so a key's identity for
+/// hashing/equality purposes never depends on which source produced it --
+/// see that field's doc for why this split matters for
+/// [`Self::tracked_static_keys`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TrackedKey {
     prefix_len: u32,
@@ -128,7 +135,18 @@ struct TrackedKey {
 /// out of the shared trie with no outer map to drop a whole subtree from.
 pub struct PolicyStore {
     trie: LpmTrie<MapData, PolicyKeyData, PolicyValue>,
-    container_keys: HashMap<u64, HashSet<TrackedKey>>,
+    /// Per-container tracked keys, each paired with the raw
+    /// `bathyscaphe_common::RuleSource` discriminant it was last inserted
+    /// with (`Static` or `Dns`). Build chunk #10 needs this split:
+    /// `daemon::apply`'s make-before-break diff, when a fresh STATIC
+    /// `policy` snapshot re-applies, must remove stale entries from the
+    /// PREVIOUS static snapshot without ever touching a DNS-derived host
+    /// route a live name-rule resolution inserted independently -- per
+    /// `bathy_build_spec.md`'s ratified POLICY MAPS section, the DNS-snoop
+    /// layer is additive to static policy, not something a later static
+    /// re-push should silently evict. [`Self::tracked_static_keys`] is the
+    /// narrowed view that diff uses instead of [`Self::tracked_keys`].
+    container_keys: HashMap<u64, HashMap<TrackedKey, u8>>,
 }
 
 impl PolicyStore {
@@ -144,8 +162,9 @@ impl PolicyStore {
         validate_policy_value(&value)?;
         let addr_bytes = addr_to_rfc4291(addr);
         let key = build_policy_key(cgroup_id, addr_bytes, prefix_bits_over_addr)?;
+        let source = value.source;
         self.trie.insert(&key, value, 0).context("POLICY map insert failed")?;
-        self.container_keys.entry(cgroup_id).or_default().insert(TrackedKey { prefix_len: key.prefix_len(), addr: addr_bytes });
+        self.container_keys.entry(cgroup_id).or_default().insert(TrackedKey { prefix_len: key.prefix_len(), addr: addr_bytes }, source);
         Ok(())
     }
 
@@ -159,7 +178,7 @@ impl PolicyStore {
             return Ok(0);
         };
         let mut removed = 0usize;
-        for tracked in keys {
+        for (tracked, _source) in keys {
             let key = Key::new(tracked.prefix_len, PolicyKeyData::new(cgroup_id, tracked.addr));
             match self.trie.remove(&key) {
                 Ok(()) => removed += 1,
@@ -227,7 +246,18 @@ impl PolicyStore {
     /// other order, so a connect never observes a half-applied policy.
     /// Empty for an unknown or never-tracked `cgroup_id`.
     pub fn tracked_keys(&self, cgroup_id: u64) -> Vec<(u32, [u8; 16])> {
-        self.container_keys.get(&cgroup_id).map(|set| set.iter().map(|k| (k.prefix_len, k.addr)).collect()).unwrap_or_default()
+        self.container_keys.get(&cgroup_id).map(|set| set.keys().map(|k| (k.prefix_len, k.addr)).collect()).unwrap_or_default()
+    }
+
+    /// Build chunk #10: the subset of [`Self::tracked_keys`] whose stored
+    /// value's `source` (`bathyscaphe_common::RuleSource` as a raw `u8`)
+    /// equals `source`. `daemon::apply`'s make-before-break diff uses this
+    /// with `RuleSource::Static as u8` as its "old keys" baseline instead
+    /// of the unfiltered [`Self::tracked_keys`], so a static `policy`
+    /// re-push's diff never removes a DNS-derived host route it never
+    /// itself inserted -- see [`Self::container_keys`]'s doc.
+    pub fn tracked_keys_by_source(&self, cgroup_id: u64, source: u8) -> Vec<(u32, [u8; 16])> {
+        self.container_keys.get(&cgroup_id).map(|set| set.iter().filter(|&(_, &s)| s == source).map(|(k, _)| (k.prefix_len, k.addr)).collect()).unwrap_or_default()
     }
 
     /// Removes exactly one previously-inserted policy entry for

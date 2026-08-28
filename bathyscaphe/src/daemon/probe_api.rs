@@ -33,10 +33,25 @@ pub trait ProbeApi: Send {
     /// Snapshot of the raw `(prefix_len, addr)` keys currently tracked for
     /// `cgroup_id`, for make-before-break diffing.
     fn tracked_policy_keys(&self, cgroup_id: u64) -> Vec<(u32, [u8; 16])>;
+    /// Build chunk #10: the subset of [`Self::tracked_policy_keys`] whose
+    /// stored value's `source` (`bathyscaphe_common::RuleSource` as a raw
+    /// `u8`) equals `source`. `daemon::apply`'s make-before-break diff uses
+    /// `RuleSource::Static as u8` here instead of the unfiltered
+    /// [`Self::tracked_policy_keys`], so re-applying a fresh static
+    /// `policy` snapshot never removes a DNS-derived host route it never
+    /// itself inserted -- see `probe::policy::PolicyStore::tracked_keys_by_source`'s
+    /// doc.
+    fn tracked_policy_keys_by_source(&self, cgroup_id: u64, source: u8) -> Vec<(u32, [u8; 16])>;
     /// Removes exactly one previously-inserted key.
     fn remove_policy_key(&mut self, cgroup_id: u64, prefix_len: u32, addr: [u8; 16]) -> Result<bool>;
     /// Removes every tracked policy entry for `cgroup_id`.
     fn release_policy_container(&mut self, cgroup_id: u64) -> Result<usize>;
+    /// Build chunk #10: deletes every `POLICY` entry (across every
+    /// container) whose `expires_at_ns` has passed `now_boottime_ns`. The
+    /// reaper for DNS-derived (and any other TTL-bearing) host routes --
+    /// see `probe::policy::PolicyStore::reap_expired`'s doc for why prompt
+    /// reaping matters beyond simple cleanup.
+    fn reap_expired_policy(&mut self, now_boottime_ns: u64) -> Result<usize>;
 
     fn set_enforcement(&mut self, cgroup_id: u64, mode: Mode, default_verdict: DefaultVerdict, generation: u64) -> Result<()>;
     fn clear_enforcement(&mut self, cgroup_id: u64) -> Result<()>;
@@ -66,12 +81,20 @@ impl ProbeApi for crate::probe::Probe {
         self.policy.tracked_keys(cgroup_id)
     }
 
+    fn tracked_policy_keys_by_source(&self, cgroup_id: u64, source: u8) -> Vec<(u32, [u8; 16])> {
+        self.policy.tracked_keys_by_source(cgroup_id, source)
+    }
+
     fn remove_policy_key(&mut self, cgroup_id: u64, prefix_len: u32, addr: [u8; 16]) -> Result<bool> {
         self.policy.remove_key(cgroup_id, prefix_len, addr)
     }
 
     fn release_policy_container(&mut self, cgroup_id: u64) -> Result<usize> {
         self.policy.release_container(cgroup_id)
+    }
+
+    fn reap_expired_policy(&mut self, now_boottime_ns: u64) -> Result<usize> {
+        self.policy.reap_expired(now_boottime_ns)
     }
 
     fn set_enforcement(&mut self, cgroup_id: u64, mode: Mode, default_verdict: DefaultVerdict, generation: u64) -> Result<()> {
@@ -132,6 +155,12 @@ pub enum MockCall {
     ReleasePolicyContainer(u64),
     SetEnforcement(u64),
     ClearEnforcement(u64),
+    /// Build chunk #10: a periodic TTL reap ran. Deliberately NOT counted
+    /// by [`MockProbe::made_no_destructive_calls`] -- reaping only ever
+    /// removes entries whose OWN `expires_at_ns` has already passed, never
+    /// live enforcement, so it is not the kind of teardown that check
+    /// exists to catch.
+    ReapExpiredPolicy,
 }
 
 impl MockProbe {
@@ -191,6 +220,10 @@ impl ProbeApi for MockProbe {
         self.policy_keys.get(&cgroup_id).map(|m| m.keys().copied().collect()).unwrap_or_default()
     }
 
+    fn tracked_policy_keys_by_source(&self, cgroup_id: u64, source: u8) -> Vec<(u32, [u8; 16])> {
+        self.policy_keys.get(&cgroup_id).map(|m| m.iter().filter(|(_, v)| v.source == source).map(|(k, _)| *k).collect()).unwrap_or_default()
+    }
+
     fn remove_policy_key(&mut self, cgroup_id: u64, prefix_len: u32, addr: [u8; 16]) -> Result<bool> {
         let removed = self.policy_keys.get_mut(&cgroup_id).map(|m| m.remove(&(prefix_len, addr)).is_some()).unwrap_or(false);
         self.calls.push(MockCall::RemovePolicyKey(cgroup_id));
@@ -200,6 +233,19 @@ impl ProbeApi for MockProbe {
     fn release_policy_container(&mut self, cgroup_id: u64) -> Result<usize> {
         let removed = self.policy_keys.remove(&cgroup_id).map(|m| m.len()).unwrap_or(0);
         self.calls.push(MockCall::ReleasePolicyContainer(cgroup_id));
+        Ok(removed)
+    }
+
+    fn reap_expired_policy(&mut self, now_boottime_ns: u64) -> Result<usize> {
+        let mut removed = 0usize;
+        for keys in self.policy_keys.values_mut() {
+            let expired: Vec<(u32, [u8; 16])> = keys.iter().filter(|(_, v)| v.expires_at_ns != PolicyValue::NEVER_EXPIRES && v.expires_at_ns < now_boottime_ns).map(|(k, _)| *k).collect();
+            for key in expired {
+                keys.remove(&key);
+                removed += 1;
+            }
+        }
+        self.calls.push(MockCall::ReapExpiredPolicy);
         Ok(removed)
     }
 

@@ -121,14 +121,22 @@ fn container_stats(probe: &dyn ProbeApi, state: &DaemonState) -> Vec<ContainerSt
 
 /// One heartbeat tick: builds and returns the `Stats` message, and as a
 /// side effect runs the R1 tamper-drop / enforce-blocked-summary
-/// accounting and the R2 escalation check. `stats_interval_s` is the
-/// negotiated cadence from `start.stats_interval_s`, needed by R2's
-/// rate/window arithmetic.
+/// accounting, the R2 escalation check, and (build chunk #10) the `POLICY`
+/// TTL reaper. `stats_interval_s` is the negotiated cadence from
+/// `start.stats_interval_s`, needed by R2's rate/window arithmetic.
+/// `now_boottime_ns` is the real `CLOCK_BOOTTIME` reading this tick reaps
+/// against -- injected rather than sampled internally so this function
+/// stays testable with a synthetic clock, the same convention
+/// `daemon::compile::compile_policy`'s `resolve_expiry` parameter uses.
 #[allow(clippy::too_many_arguments)]
-pub fn tick(runtime: &mut StatsRuntime, probe: &mut dyn ProbeApi, state: &mut DaemonState, attributor: &dyn Attributor, security: &SecurityEmitter, sink: &mut dyn EventSink, r2_config: &DropEscalationConfig, stats_interval_s: u64) -> Stats {
+pub fn tick(runtime: &mut StatsRuntime, probe: &mut dyn ProbeApi, state: &mut DaemonState, attributor: &dyn Attributor, security: &SecurityEmitter, sink: &mut dyn EventSink, r2_config: &DropEscalationConfig, stats_interval_s: u64, now_boottime_ns: u64) -> Stats {
     runtime.seq += 1;
     let timestamp = now_rfc3339();
     let mut events_dropped_total = 0u64;
+
+    if let Err(error) = probe.reap_expired_policy(now_boottime_ns) {
+        eprintln!("bathyscaphe: POLICY TTL reap failed this tick ({error:#}); expired entries (if any) will be retried next tick");
+    }
 
     for cgroup_id in probe.attached_containers() {
         let total = probe.read_tamper(cgroup_id).map(|t| t.events_dropped).unwrap_or(0);
@@ -247,7 +255,7 @@ mod tests {
         let (_counting, events_emitted, denies) = CountingSink::new(NoopSink);
         let mut runtime = StatsRuntime::new(events_emitted, denies);
 
-        let stats = tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10);
+        let stats = tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10, 0);
         assert_eq!(stats.seq, 1);
         assert_eq!(stats.containers.len(), 1);
         assert_eq!(stats.containers[0].id, "c1");
@@ -265,7 +273,7 @@ mod tests {
         let (_counting, events_emitted, denies) = CountingSink::new(NoopSink);
         let mut runtime = StatsRuntime::new(events_emitted, denies);
 
-        let stats = tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10);
+        let stats = tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10, 0);
         assert_eq!(stats.events_dropped_total, 5);
         assert_eq!(stats.containers[0].dropped_total, 5);
         assert_eq!(sink.0.len(), 1);
@@ -289,7 +297,7 @@ mod tests {
         let mut runtime = StatsRuntime::new(events_emitted, denies);
         let config = DropEscalationConfig { enabled: true, threshold_per_sec: 1.0, window_s: 1, action: EscalationAction::Lockdown };
 
-        tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &config, 1);
+        tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &config, 1, 0);
 
         let enforcement = probe.get_enforcement(1).unwrap().unwrap();
         assert_eq!(Mode::try_from(enforcement.mode).unwrap(), Mode::Block);
@@ -324,10 +332,35 @@ mod tests {
             }));
         }
 
-        let stats = tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10);
+        let stats = tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10, 0);
         assert_eq!(stats.events_emitted, 3);
         assert_eq!(sink.0.len(), 1, "3 denies collapse into exactly one throttled summary record");
         let UpMessage::Security(record) = &sink.0[0] else { panic!("expected a security record") };
         assert_eq!(record.attributes.get("denied_count").unwrap(), 3);
+    }
+
+    #[test]
+    fn a_tick_reaps_an_expired_policy_entry() {
+        // Build chunk #10: the periodic tick this test drives directly is
+        // exactly the wiring `daemon::mod::spawn_stats_thread` runs on a
+        // real cadence -- this proves the reaper actually fires from that
+        // call site's shape, using a synthetic `now_boottime_ns` rather
+        // than a real clock/thread/sleep.
+        let (mut probe, mut state) = seeded_probe_and_state();
+        probe.set_policy(1, IpAddr::from([93, 184, 216, 34]), 128, bathyscaphe_common::PolicyValue::new(0, bathyscaphe_common::RuleSource::Dns as u8, 500)).unwrap();
+        assert_eq!(probe.tracked_policy_keys(1).len(), 2, "the baseline entry plus the short-lived DNS host route");
+
+        let attributor = StubAttributor;
+        let security = SecurityEmitter::new();
+        let mut sink = CapturingSink(Vec::new());
+        let (_counting, events_emitted, denies) = CountingSink::new(NoopSink);
+        let mut runtime = StatsRuntime::new(events_emitted, denies);
+
+        // now_boottime_ns (1000) is past the DNS entry's expires_at_ns
+        // (500) but this test's OTHER seeded policy entry never expires
+        // (NEVER_EXPIRES == 0), so only the one entry should be reaped.
+        tick(&mut runtime, &mut probe, &mut state, &attributor, &security, &mut sink, &DropEscalationConfig::default(), 10, 1000);
+
+        assert_eq!(probe.tracked_policy_keys(1).len(), 1, "the expired DNS host route must be gone; the never-expiring baseline entry must remain");
     }
 }

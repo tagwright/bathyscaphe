@@ -57,9 +57,10 @@ reconciliation input, see section 6; empty on true cold start).
 Capability registry (v1): `observe`, `enforce`, `enforce_udp`,
 `dns_enrich`, `sni_enrich`, `enforce_fqdn`. The first v1 build shipped
 `["observe", "enforce", "enforce_udp"]`; the DNS-observation build chunk
-(`docs/DNS.md`) added `dns_enrich` with no wire change, so a current build
-ships `["observe", "enforce", "enforce_udp", "dns_enrich"]`. `sni_enrich`
-and `enforce_fqdn` remain unbuilt. Unknown capability strings decode to
+added `dns_enrich`, and the FQDN-enforcement build chunk (`docs/DNS.md`)
+added `enforce_fqdn`, both with no wire change, so a current build ships
+`["observe", "enforce", "enforce_udp", "dns_enrich", "enforce_fqdn"]`.
+`sni_enrich` remains unbuilt. Unknown capability strings decode to
 `Capability::Unknown` rather than erroring (forward-compat; airlock's own
 Go-side reader independently ignores strings it doesn't recognize).
 
@@ -285,8 +286,14 @@ dot-namespaced attribute keys — not a nested object — always including
 `rule_id` and/or `domain` present only when relevant).
 
 **Stable `reason` codes** (`bathyscaphe_proto::security::reason`):
-`policy.unenforceable_name`, `tamper.event_drops`, `policy.violation`,
-`enforce.blocked`.
+`policy.unenforceable_name` (reserved for a build without `enforce_fqdn`;
+never emitted by a build advertising it), `tamper.event_drops`,
+`policy.violation` (reserved, not yet emitted by any build),
+`enforce.blocked`, and (build chunk #10) `policy.name_unresolved_block` --
+a container with an active allow-listed name rule was denied a connection
+to a destination this build never observed a DNS answer for at all
+(raw-IP egress, or a DoH/DoT/ECH lookup it cannot see). See `docs/DNS.md`
+for the full FQDN-enforcement design this reason belongs to.
 
 **Severity mapping**, the trivial part that lets airlock forward a
 `security` record to beacon with no remapping:
