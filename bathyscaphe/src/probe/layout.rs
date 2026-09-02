@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The bpffs pin subtree layout. See `probe`'s module doc for the full
 //! picture (fresh-load vs resumed-boot lifecycle); this module owns only
 //! the path arithmetic and the "what's actually on disk right now" check.

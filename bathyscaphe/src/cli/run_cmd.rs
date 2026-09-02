@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe run`: the airlock-driven subprocess mode. Maps CLI flags
 //! into a [`crate::daemon::DaemonConfig`] and calls
 //! [`crate::daemon::Daemon::run`] -- this module owns no protocol I/O, no

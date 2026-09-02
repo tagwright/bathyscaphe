@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe-proto`: the frozen airlock wire protocol.
 //!
 //! NDJSON, one JSON object per line, on two of bathyscaphe's three

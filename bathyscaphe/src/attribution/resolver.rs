@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The combined `cgroup_id -> Attribution` resolver, and
 //! [`AttributionService`], the one-call bundle a later chunk's daemon wires
 //! up: start the cgroup watcher and the enrichment watcher together, get

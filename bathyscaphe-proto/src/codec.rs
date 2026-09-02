@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! A thin NDJSON line codec. This crate owns the message types and the
 //! single-line encode/decode step; the daemon owns the actual I/O loop
 //! (reading stdin line by line, writing stdout, counting consecutive

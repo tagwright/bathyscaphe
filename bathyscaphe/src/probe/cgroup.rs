@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Deriving a cgroup id from a cgroup v2 directory path.
 
 use std::os::unix::fs::MetadataExt;

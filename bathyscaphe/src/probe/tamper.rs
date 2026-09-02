@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The `TAMPER` map API: read-only from userspace (only the kernel programs
 //! ever write it, on a `RingBuf` reserve failure -- see
 //! `bathyscaphe_common::counters`'s module doc).

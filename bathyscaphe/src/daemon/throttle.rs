@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! A shared token-bucket throttle for the loud `security` records
 //! (refinement R1): the Falco pattern (a small burst allowance plus a slow
 //! steady refill, roughly "1 every 30s" once the burst is spent) so a

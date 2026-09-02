@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The kernel-written DNS capture record: what the DNS-snoop `cgroup_skb`
 //! program (`bathyscaphe-ebpf::dns`, build chunk #9) writes into the
 //! `DNS_EVENTS` `RingBuf` for every UDP datagram it judges to be a DNS

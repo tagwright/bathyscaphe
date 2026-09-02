@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The CLI's own operational logging to stderr: `bathy_build_spec.md`'s
 //! global `--log-format`/`--log-level` flags. `bathyscaphe-proto::security`
 //! already documents that bathyscaphe's stderr logs use the same

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The stdin directive reader: one NDJSON line per [`DownMessage`],
 //! enforcing `docs/PROTOCOL.md` section 1's codec limits
 //! (`bathyscaphe_proto::MAX_LINE_BYTES`,

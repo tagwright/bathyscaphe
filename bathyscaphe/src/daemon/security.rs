@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Building and throttled emission of the R1 loud `security` records:
 //! `tamper.event_drops`, `enforce.blocked`, and (build chunk #10)
 //! `policy.name_unresolved_block`. `policy.violation` is a reserved reason

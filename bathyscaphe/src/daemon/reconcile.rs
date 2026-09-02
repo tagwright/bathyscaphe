@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The `sync_complete` orphan-marking pass (`docs/PROTOCOL.md` section 6):
 //! after airlock has re-pushed every snapshot it manages on `start` ->
 //! resync, anything this process found ENFORCING in the kernel that

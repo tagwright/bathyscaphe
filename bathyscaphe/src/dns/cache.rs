@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The per-container `dst IP -> {domain, confidence}` cache built from
 //! snooped DNS answers ([`super::parse::parse_dns_response`]), read by
 //! [`crate::pipeline::map`] to enrich `connect` events with `domain.*`

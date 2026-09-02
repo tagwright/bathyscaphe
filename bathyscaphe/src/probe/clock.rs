@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `CLOCK_BOOTTIME` in userspace, matching the clock the kernel programs use
 //! for `PolicyValue::expires_at_ns` and `Event::ktime_ns`
 //! (`bpf_ktime_get_boot_ns()`). `std::time::Instant` is deliberately not

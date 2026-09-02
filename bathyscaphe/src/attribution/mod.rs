@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Container attribution: `cgroup_id -> containerId/containerName/
 //! containerImageName`, entirely in Rust with no dependency on
 //! `github.com/tagwright/core` (`bathy_attribution.md` is the authority).

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The `ENFORCEMENT` map API: per-container posture (mode + default verdict
 //! + generation). See `bathyscaphe_common::enforcement`'s module doc --
 //! absence of an entry, not a field on it, is what "no enforcement

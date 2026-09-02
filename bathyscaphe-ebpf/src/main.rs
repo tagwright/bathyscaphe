@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe-ebpf`: the kernel-side programs, built with `bpf-linker`
 //! against a `bpfel`/`bpfeb`-unknown-none target (see docs/BUILDING.md).
 //!

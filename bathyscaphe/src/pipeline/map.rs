@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Pure kernel-`Event` -> wire-`Event` mapping, unit-testable with no ring
 //! buffer, no cgroup tree, and no Docker socket in sight.
 

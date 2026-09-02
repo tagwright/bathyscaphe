@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Leaf types shared by the up and down messages: container/process
 //! attribution, endpoints, and the enums used across more than one
 //! message kind.

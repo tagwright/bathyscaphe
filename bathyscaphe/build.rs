@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Drives the nightly + bpf-linker build of `bathyscaphe-ebpf` as a build
 //! dependency of the stable userspace crate, via `aya-build`. See
 //! docs/BUILDING.md for the exact toolchain this depends on.

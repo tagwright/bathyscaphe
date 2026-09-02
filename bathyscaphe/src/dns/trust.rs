@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The trusted-resolver allowlist (build chunk #11): closes the passive-DNS
 //! spoofing gap `docs/DNS.md` documented under chunks #9/#10 -- `dns_snoop`
 //! (`bathyscaphe-ebpf::dns`) trusts *any* UDP:53-sourced datagram it

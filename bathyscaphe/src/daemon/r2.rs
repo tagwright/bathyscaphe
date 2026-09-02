@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Refinement R2: OPT-IN fail-closed-on-sustained-drops
 //! (`bathy_build_spec.md`'s R2 section), modeled on Falco's
 //! `syscall_event_drops` `exit`/`log`/`alert` actions gated by a

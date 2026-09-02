@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The isolation-safe `POLICY` map API.
 //!
 //! `bathyscaphe_common::policy`'s module doc explains why this workspace's

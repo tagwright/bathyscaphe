@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe`: the userspace loader/daemon binary.
 //!
 //! The CLI build chunk (`bathy_build_spec.md`'s build sequence step 7) is

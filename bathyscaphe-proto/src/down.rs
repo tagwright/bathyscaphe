@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Messages airlock writes to bathyscaphe's stdin, one NDJSON line each.
 
 use serde::{Deserialize, Serialize};

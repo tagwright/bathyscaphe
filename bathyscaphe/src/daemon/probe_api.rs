@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! [`ProbeApi`]: the seam between the daemon's directive-compilation and
 //! reconciliation logic and the real, kernel-touching [`crate::probe::Probe`].
 //! Every daemon module that needs to read or write a kernel map depends on

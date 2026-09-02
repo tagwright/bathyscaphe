@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Pure directive compilation: a wire [`bathyscaphe_proto::down::Policy`]
 //! snapshot -> the bounded set of `POLICY`/`ENFORCEMENT` map writes that
 //! implement it. No probe, no map, no I/O -- this is the piece

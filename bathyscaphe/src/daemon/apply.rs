@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Applying a compiled directive against a [`ProbeApi`]: resolving
 //! `container_id -> cgroup_id`/path (attaching if needed), the
 //! make-before-break key diff, updating [`DaemonState`], and (build chunk

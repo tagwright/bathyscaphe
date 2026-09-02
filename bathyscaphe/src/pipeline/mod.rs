@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The event pipeline: turns a decoded `bathyscaphe_common::Event` (chunk
 //! #5's `probe::events::EventConsumer` output) into a
 //! `bathyscaphe_proto::up::Event` (the wire type) and hands it to a sink.

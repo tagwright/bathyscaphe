@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Building this crate has an undeclared dependency on the `bpf-linker`
 //! binary. This would be better expressed by artifact-dependencies
 //! (https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#artifact-dependencies)

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The DAEMON + PROTOCOL I/O build chunk: where the probe (chunk #5) and
 //! the attribution/pipeline (chunk #6) become a running process airlock
 //! actually drives over stdin/stdout/stderr per `docs/PROTOCOL.md`.

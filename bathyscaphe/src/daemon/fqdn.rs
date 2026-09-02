@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! FQDN enforcement (build chunks #10-#11): the pieces that turn a
 //! correctly-attributed DNS answer (`crate::dns::AttributedAnswer`) and a
 //! container's registered name-rule patterns (`crate::dns::NamePatternStore`,

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Parsing a captured, possibly-truncated UDP DNS response payload
 //! (`bathyscaphe_common::DnsCapture::captured()`) into the queried name
 //! plus every resolved A/AAAA answer address and its TTL.

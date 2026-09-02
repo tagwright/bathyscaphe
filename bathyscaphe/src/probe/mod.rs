@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The userspace eBPF lifecycle: load-or-reopen, attach/detach a container's
 //! cgroup, fail-closed bpffs pinning, and the typed map APIs
 //! ([`policy::PolicyStore`], [`enforcement::EnforcementStore`],

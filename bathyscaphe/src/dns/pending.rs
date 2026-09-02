@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Query/response correlation (build chunk #10, hardened build chunk #14):
 //! [`PendingQueryTable`] is the userspace PENDING-QUERY table `docs/DNS.md`'s
 //! attribution problem calls for.

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Round-trip and golden-line tests for the frozen wire protocol.
 //!
 //! Round-trip tests prove every message type survives an encode/decode

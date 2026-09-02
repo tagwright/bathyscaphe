@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The CLI build chunk: `bathyscaphe run` / `unpin --all` / `observe` /
 //! `version`, per `bathy_build_spec.md`'s build sequence step 7. Each
 //! subcommand's body is deliberately thin -- it maps flags into the

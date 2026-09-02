@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Shared `repr(u8)` enums for values that cross the kernel/user boundary
 //! as raw bytes inside the [`crate::event`] and [`crate::policy`] structs.
 //!

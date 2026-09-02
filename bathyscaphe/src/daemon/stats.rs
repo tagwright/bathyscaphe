@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The periodic `stats` heartbeat (`docs/PROTOCOL.md` section 5): emitted
 //! every `stats_interval_s`, ALWAYS, even fully idle, so airlock can tell
 //! "no traffic" from "probe wedged" (three missed intervals = probe

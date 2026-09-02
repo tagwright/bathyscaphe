@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The loud-accounting security record (refinement R1): a first-class
 //! `security` up-message for security-relevant conditions (an
 //! unenforceable name rule in block mode, sustained event drops, a

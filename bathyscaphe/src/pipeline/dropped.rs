@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `meta.dropped_since_last`: a per-cgroup delta of the kernel's cumulative
 //! `TAMPER` counter (`probe::tamper::TamperStore::read_tamper`) against the
 //! value seen at this container's last EMITTED event, per

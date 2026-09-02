@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! DNS query observation: `cgroup/dns_query_snoop`, a `cgroup_skb` program
 //! attached **egress** to a container's cgroup, that recognizes a UDP
 //! datagram whose destination port is 53 (a DNS query LEAVING the

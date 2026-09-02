@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The `DNS_QUERIES` `RingBuf` consumer (build chunk #10): the same
 //! plumbing-only shape as `probe::dns::DnsCaptureConsumer` (a dedicated
 //! `poll(2)`-driven OS thread, the identical shutdown-flag-and-join

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Byte-level extraction from the `bpf_sock_addr` context the kernel hands
 //! `cgroup/connect4`, `cgroup/connect6`, `cgroup/sendmsg4`, and
 //! `cgroup/sendmsg6` programs (`bathy_ebpf_design.md` section 1a).

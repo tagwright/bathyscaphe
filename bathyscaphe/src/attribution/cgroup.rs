@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `cgroup_id -> container_id` resolution: the deterministic half of
 //! attribution. `bathy_attribution.md` section 1 is the authority; this
 //! module implements it directly, with no BPF map round trip needed for

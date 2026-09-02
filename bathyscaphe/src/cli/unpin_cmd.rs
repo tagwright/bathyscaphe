@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe unpin --all`: the standalone break-glass
 //! (`bathy_build_spec.md`'s ratified architecture section). Calls
 //! [`crate::probe::Probe::unpin_all_at`] directly -- no [`crate::daemon::Daemon::run`],

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Messages bathyscaphe writes to stdout, one NDJSON line each. See
 //! `docs/PROTOCOL.md` and `bathy_protocol_draft.md` for the framing and
 //! reconciliation model these messages participate in.

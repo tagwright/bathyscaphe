@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The kernel-floor check: cgroup v2 unified hierarchy + Linux 5.8+
 //! (`RingBuf`, `CAP_BPF`). Per `bathy_ebpf_design.md` section 5 and
 //! `bathy_build_spec.md`'s ratified architecture: fail LOUD on an

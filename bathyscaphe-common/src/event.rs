@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The kernel-written event struct: what the connect4/connect6 and
 //! udp4/6-sendmsg hooks (`bathyscaphe-ebpf`, chunk #4) write into the
 //! shared `RingBuf` on every invocation, regardless of the allow/deny

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! FQDN name-rule patterns (build chunk #10): [`NamePatternStore`] is the
 //! per-container registry of `type: "name"` rule patterns
 //! (`docs/PROTOCOL.md` section 4) `daemon::apply` populates from a

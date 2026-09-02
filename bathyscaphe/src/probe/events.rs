@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The `EVENTS` `RingBuf` consumer: plumbing only. Decoding a raw
 //! `bathyscaphe_common::Event` off the wire and handing it to a callback is
 //! this chunk's job; enriching `cgroup_id` into container attribution and

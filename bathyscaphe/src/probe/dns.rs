@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The `DNS_EVENTS` `RingBuf` consumer: plumbing only, deliberately the
 //! same shape as `probe::events::EventConsumer` (same dedicated
 //! `poll(2)`-driven OS thread, same shutdown-flag-and-join lifecycle) but

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The two seams a later chunk plugs into: [`EventSink`] (where mapped
 //! wire events go) and [`TamperSource`] (where the per-cgroup drop count
 //! comes from). Both are plain traits over what this chunk already has in

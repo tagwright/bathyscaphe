@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The stdout writer: drains the shared `mpsc::Receiver<UpMessage>` fed by
 //! the ring-buf pipeline (`pipeline::sink::EventSink for Sender<UpMessage>`,
 //! chunk #6), the stats/heartbeat thread, and the throttled `security`

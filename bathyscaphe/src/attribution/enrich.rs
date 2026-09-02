@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `container_id -> name/image` enrichment over the Docker/Podman socket
 //! (`bathy_attribution.md` section 2). This is the racy, best-effort half
 //! of attribution: [`super::cgroup`] gives a `container_id` deterministically

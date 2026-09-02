@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The per-cgroup tamper counter: the map value the kernel bumps on
 //! `RingBuf` reserve failure (the connect/sendmsg hook could not get
 //! space to write an [`crate::event::Event`] and had to drop it silently

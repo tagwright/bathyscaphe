@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The daemon's own bookkeeping: what it currently believes about each
 //! container it holds policy state for. This is deliberately separate from
 //! kernel ground truth (`EnforcementState`, read fresh from

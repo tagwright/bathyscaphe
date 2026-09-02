@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe observe`: a standalone, observe-only mode for manual
 //! verification and debugging. No airlock, no NDJSON handshake, no
 //! enforcement -- it loads the probe, attaches to every running container

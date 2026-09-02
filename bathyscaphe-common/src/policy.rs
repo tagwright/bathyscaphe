@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The in-kernel policy map schema (ratified 2026-08-27, superseding the
 //! flagged-for-arbitration flat combined-key scheme this crate shipped
 //! with in the COMMON build chunk).

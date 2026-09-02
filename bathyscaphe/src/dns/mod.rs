@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The DNS observation domain layer (build chunk #9): parsing captured raw
 //! DNS response payloads and the per-container IP->domain cache that
 //! feeds today's event enrichment ([`crate::pipeline::map`]) and will feed

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! Building the `hello` handshake message: the fixed capability set this
 //! build advertises, plus the `pinned` reconciliation inventory discovered
 //! from whatever [`super::probe_api::ProbeApi::attached_containers`]

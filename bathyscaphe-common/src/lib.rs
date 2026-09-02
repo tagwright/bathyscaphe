@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! `bathyscaphe-common`: `no_std`, `repr(C)`, `aya::Pod`-derivable types
 //! shared between the kernel-side eBPF programs (`bathyscaphe-ebpf`,
 //! chunk #4) and the userspace loader/daemon (`bathyscaphe`, chunks

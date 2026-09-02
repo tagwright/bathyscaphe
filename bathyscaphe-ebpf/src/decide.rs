@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The one policy decision + event-emission routine shared by all four
 //! `cgroup/{connect,sendmsg}{4,6}` hooks (`bathy_ebpf_design.md` section
 //! 2, "one hook, two output paths"). Written once here so enforcement and

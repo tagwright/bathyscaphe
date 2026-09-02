@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The four maps the connect/sendmsg/sock_create hooks share. See
 //! `bathyscaphe-common::policy` for why [`POLICY`] is one flat `LpmTrie`
 //! (with `cgroup_id` folded into the key) rather than a map-in-map, and

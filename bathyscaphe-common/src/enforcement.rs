@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 techgaud
 //! The outer per-cgroup **enforcement state**: the map value that tells
 //! the kernel connect/sendmsg hooks a container's current posture, keyed
 //! directly by `cgroup_id: u64` (the map declaration itself — a plain
