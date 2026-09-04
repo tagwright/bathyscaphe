@@ -22,3 +22,10 @@ __pycache__/
 # accidentally dumping a debug copy in-tree
 /pinned/
 /sys-fs-bpf-debug/
+
+# CLAUDE.md and CHARTER.md are internal knowledge, versioned centrally in the
+# techgaud/projects-docs repo rather than committed to this codebase repo. They
+# stay on disk so the CLAUDE cascade still resolves. User-facing docs/ stays
+# tracked and published here, matching the other tagwright FOSS tools.
+CLAUDE.md
+CHARTER.md
