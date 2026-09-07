@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-BATHYSCAPHE_BIN = os.environ.get("BATHYSCAPHE_BIN", "/workspace/bathyscaphe/target/release/bathyscaphe")
+BATHYSCAPHE_BIN = os.environ.get("BATHYSCAPHE_BIN", "./target/release/bathyscaphe")
 ITEST_PREFIX = "bathyscaphe-itest-"
 
 
