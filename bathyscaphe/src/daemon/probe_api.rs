@@ -145,6 +145,30 @@ pub struct MockProbe {
     pub enforcement: HashMap<u64, EnforcementState>,
     pub tamper: HashMap<u64, TamperCounter>,
     pub calls: Vec<MockCall>,
+
+    /// Per-operation fault injection. When a field is `Some(msg)`, the
+    /// matching mutating op returns `Err(msg)` BEFORE mutating any state and
+    /// without recording a success call, standing in for a kernel-map write
+    /// that fails (EPERM, ENOMEM, a full LpmTrie). A wiring test that never
+    /// trips a knob only proves the happy path; these knobs are what let a
+    /// test assert a failed map write SURFACES rather than being acked as
+    /// Applied (the enforcement fail-open class). The zero value injects
+    /// nothing, so an untouched MockProbe behaves exactly as before.
+    pub faults: Faults,
+}
+
+/// One injectable error per mutating [`ProbeApi`] operation on [`MockProbe`].
+/// A `Some(msg)` makes that op fail with `msg`; the default injects nothing.
+#[derive(Default)]
+pub struct Faults {
+    pub attach_container: Option<String>,
+    pub detach_container: Option<String>,
+    pub set_policy: Option<String>,
+    pub remove_policy_key: Option<String>,
+    pub release_policy_container: Option<String>,
+    pub reap_expired_policy: Option<String>,
+    pub set_enforcement: Option<String>,
+    pub clear_enforcement: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +210,9 @@ impl MockProbe {
 
 impl ProbeApi for MockProbe {
     fn attach_container(&mut self, cgroup_path: &Path) -> Result<u64> {
+        if let Some(msg) = &self.faults.attach_container {
+            anyhow::bail!("{msg}");
+        }
         let cgroup_id = *self.path_to_cgroup_id.entry(cgroup_path.to_path_buf()).or_insert_with(|| {
             self.next_cgroup_id += 1;
             self.next_cgroup_id
@@ -198,6 +225,9 @@ impl ProbeApi for MockProbe {
     }
 
     fn detach_container(&mut self, cgroup_id: u64) -> Result<()> {
+        if let Some(msg) = &self.faults.detach_container {
+            anyhow::bail!("{msg}");
+        }
         if !self.attached.remove(&cgroup_id) {
             anyhow::bail!("cgroup {cgroup_id} not attached");
         }
@@ -210,6 +240,9 @@ impl ProbeApi for MockProbe {
     }
 
     fn set_policy(&mut self, cgroup_id: u64, addr: IpAddr, prefix_bits_over_addr: u32, value: PolicyValue) -> Result<()> {
+        if let Some(msg) = &self.faults.set_policy {
+            anyhow::bail!("{msg}");
+        }
         let addr_bytes = crate::probe::policy::addr_to_rfc4291(addr);
         let prefix_len = bathyscaphe_common::PolicyKeyData::MIN_PREFIX_LEN + prefix_bits_over_addr;
         self.policy_keys.entry(cgroup_id).or_default().insert((prefix_len, addr_bytes), value);
@@ -226,18 +259,27 @@ impl ProbeApi for MockProbe {
     }
 
     fn remove_policy_key(&mut self, cgroup_id: u64, prefix_len: u32, addr: [u8; 16]) -> Result<bool> {
+        if let Some(msg) = &self.faults.remove_policy_key {
+            anyhow::bail!("{msg}");
+        }
         let removed = self.policy_keys.get_mut(&cgroup_id).map(|m| m.remove(&(prefix_len, addr)).is_some()).unwrap_or(false);
         self.calls.push(MockCall::RemovePolicyKey(cgroup_id));
         Ok(removed)
     }
 
     fn release_policy_container(&mut self, cgroup_id: u64) -> Result<usize> {
+        if let Some(msg) = &self.faults.release_policy_container {
+            anyhow::bail!("{msg}");
+        }
         let removed = self.policy_keys.remove(&cgroup_id).map(|m| m.len()).unwrap_or(0);
         self.calls.push(MockCall::ReleasePolicyContainer(cgroup_id));
         Ok(removed)
     }
 
     fn reap_expired_policy(&mut self, now_boottime_ns: u64) -> Result<usize> {
+        if let Some(msg) = &self.faults.reap_expired_policy {
+            anyhow::bail!("{msg}");
+        }
         let mut removed = 0usize;
         for keys in self.policy_keys.values_mut() {
             let expired: Vec<(u32, [u8; 16])> = keys.iter().filter(|(_, v)| v.expires_at_ns != PolicyValue::NEVER_EXPIRES && v.expires_at_ns < now_boottime_ns).map(|(k, _)| *k).collect();
@@ -251,12 +293,18 @@ impl ProbeApi for MockProbe {
     }
 
     fn set_enforcement(&mut self, cgroup_id: u64, mode: Mode, default_verdict: DefaultVerdict, generation: u64) -> Result<()> {
+        if let Some(msg) = &self.faults.set_enforcement {
+            anyhow::bail!("{msg}");
+        }
         self.enforcement.insert(cgroup_id, EnforcementState::new(generation, mode as u8, default_verdict as u8));
         self.calls.push(MockCall::SetEnforcement(cgroup_id));
         Ok(())
     }
 
     fn clear_enforcement(&mut self, cgroup_id: u64) -> Result<()> {
+        if let Some(msg) = &self.faults.clear_enforcement {
+            anyhow::bail!("{msg}");
+        }
         self.enforcement.remove(&cgroup_id);
         self.calls.push(MockCall::ClearEnforcement(cgroup_id));
         Ok(())
