@@ -19,7 +19,7 @@
 
 use std::sync::Mutex;
 
-use bathyscaphe_common::{PolicyKeyData, RuleSource};
+use bathyscaphe_common::{DefaultVerdict, PolicyKeyData, RuleSource};
 use bathyscaphe_proto::down::Policy;
 use bathyscaphe_proto::{PolicyAck, PolicyAckStatus, ReleaseAck, ReleaseStatus};
 
@@ -82,8 +82,25 @@ fn resolve_or_attach(probe: &mut dyn ProbeApi, lookup: &dyn ContainerLookup, con
 /// the DNS-snoop layer is additive to static policy. A DNS route's own
 /// lifecycle is governed entirely by its TTL (`ProbeApi::reap_expired_policy`)
 /// or an explicit `release`, never by an unrelated static resnapshot.
-fn apply_make_before_break(probe: &mut dyn ProbeApi, cgroup_id: u64, compiled: &CompiledPolicy) {
+/// What the make-before-break diff reports back to [`apply_policy`] so it can
+/// decide the enforcement write safely on a partial failure (#544).
+struct MakeBeforeBreak {
+    /// Any POLICY-map write (a `set_policy` insert or a `remove_policy_key`
+    /// break) failed, so the keys actually enforced are NOT the compiled
+    /// snapshot. The generation must not be acked `Applied`, and enforcement
+    /// must fail closed, never open.
+    write_failed: bool,
+    /// This container had no prior STATIC policy keys: this is its first policy
+    /// push. It separates "a brand-new container must never be left unenforced"
+    /// (fail closed to deny-default) from "a container that was already
+    /// enforcing must not be broken" (leave its prior posture in place).
+    first_push: bool,
+}
+
+fn apply_make_before_break(probe: &mut dyn ProbeApi, cgroup_id: u64, compiled: &CompiledPolicy) -> MakeBeforeBreak {
     let old_keys = probe.tracked_policy_keys_by_source(cgroup_id, RuleSource::Static as u8);
+    let first_push = old_keys.is_empty();
+    let mut write_failed = false;
 
     let mut new_keys: std::collections::HashSet<(u32, [u8; 16])> = std::collections::HashSet::with_capacity(compiled.entries.len());
     for entry in &compiled.entries {
@@ -91,6 +108,7 @@ fn apply_make_before_break(probe: &mut dyn ProbeApi, cgroup_id: u64, compiled: &
         new_keys.insert((PolicyKeyData::MIN_PREFIX_LEN + entry.prefix_bits_over_addr, addr_bytes));
         if let Err(error) = probe.set_policy(cgroup_id, entry.addr, entry.prefix_bits_over_addr, entry.value) {
             eprintln!("bathyscaphe: POLICY insert failed for cgroup {cgroup_id:016x} at {}/{} ({error}); this entry may be missing from enforcement", entry.addr, entry.prefix_bits_over_addr);
+            write_failed = true;
         }
     }
 
@@ -98,9 +116,12 @@ fn apply_make_before_break(probe: &mut dyn ProbeApi, cgroup_id: u64, compiled: &
         if !new_keys.contains(&(prefix_len, addr)) {
             if let Err(error) = probe.remove_policy_key(cgroup_id, prefix_len, addr) {
                 eprintln!("bathyscaphe: POLICY remove failed for cgroup {cgroup_id:016x} at prefix_len={prefix_len} ({error}); a stale entry may remain enforced");
+                write_failed = true;
             }
         }
     }
+
+    MakeBeforeBreak { write_failed, first_push }
 }
 
 /// Converts a snapshot's compiled name patterns into the
@@ -111,6 +132,13 @@ fn to_dns_patterns(compiled: &[compile::CompiledNamePattern]) -> Vec<NamePattern
     compiled.iter().map(|p| NamePattern { rule_id: p.rule_id.clone(), pattern: p.pattern.clone(), action: p.action, port: p.port, proto: p.proto }).collect()
 }
 
+/// Builds an `Error` [`PolicyAck`] for `policy` carrying `error`. Every failure
+/// path in [`apply_policy`] returns one of these, so a failed generation is
+/// never acked `Applied` (the #544 fail-open class) and always names why.
+fn error_ack(policy: &Policy, inert_rules: u32, error: String) -> PolicyAck {
+    PolicyAck { container_id: policy.container_id.clone(), generation: policy.generation, status: PolicyAckStatus::Error, inert_rules, error: Some(error) }
+}
+
 /// Applies one `policy` directive end to end: compile, resolve/attach,
 /// make-before-break, update [`DaemonState`], register this snapshot's
 /// name-rule patterns (build chunk #10), and produce the `policy_ack`.
@@ -118,27 +146,50 @@ pub fn apply_policy(probe: &mut dyn ProbeApi, state: &mut DaemonState, lookup: &
     let compiled = match compile::compile_policy(policy, |s| resolve_expiry(s, boot_offset_ns)) {
         Ok(compiled) => compiled,
         Err(error) => {
-            return PolicyAck { container_id: policy.container_id.clone(), generation: policy.generation, status: PolicyAckStatus::Error, inert_rules: 0, error: Some(error.0) };
+            return error_ack(policy, 0, error.0);
         }
     };
 
     let cgroup_id = match resolve_or_attach(probe, lookup, &policy.container_id) {
         Ok(cgroup_id) => cgroup_id,
         Err(error) => {
-            return PolicyAck { container_id: policy.container_id.clone(), generation: policy.generation, status: PolicyAckStatus::Error, inert_rules: compiled.inert_rules, error: Some(error) };
+            return error_ack(policy, compiled.inert_rules, error);
         }
     };
 
-    apply_make_before_break(probe, cgroup_id, &compiled);
+    let mbb = apply_make_before_break(probe, cgroup_id, &compiled);
+
+    // #544: a partial POLICY-map write must never be acked Applied, and the
+    // container must fail closed, never open. What "fail closed" means depends
+    // on whether this is a brand-new container or an update:
+    if mbb.write_failed {
+        let base = format!("POLICY map write(s) failed for cgroup {cgroup_id:016x}; the enforced rule set is not the compiled snapshot");
+        if mbb.first_push {
+            // Brand-new container: it has no prior policy to fall back on, and
+            // leaving it observe-only would mean egress wide open. Force a
+            // deny-default under the compiled mode, so an ALLOW that failed to
+            // insert is denied and a DENY that failed to insert cannot leak.
+            // (In Block mode this is hard fail-closed; in Audit/Alert mode the
+            // container was never promised blocking, so this only tightens the
+            // recorded default.) Then ack Error so airlock resends.
+            if let Err(error) = probe.set_enforcement(cgroup_id, compiled.mode, DefaultVerdict::Deny, compiled.generation) {
+                return error_ack(policy, compiled.inert_rules, format!("{base}; and the fail-closed deny-default enforcement write also failed: {error}"));
+            }
+            return error_ack(policy, compiled.inert_rules, format!("{base}; forced fail-closed to deny-default pending a resend"));
+        }
+        // Update to a container that was already enforcing: do NOT flip it to
+        // this partially-applied generation (that could swap in a more
+        // permissive default while the matching allows never landed). Leave its
+        // prior enforcement posture in place and ack Error so airlock resends.
+        // The key map may be tighter than before (make-before-break removed
+        // stale keys), which is fail-closed and safe; what matters is the
+        // container is never left open and never acked Applied on a partial
+        // write.
+        return error_ack(policy, compiled.inert_rules, format!("{base}; prior enforcement left in place pending a resend"));
+    }
 
     if let Err(error) = probe.set_enforcement(cgroup_id, compiled.mode, compiled.default, compiled.generation) {
-        return PolicyAck {
-            container_id: policy.container_id.clone(),
-            generation: policy.generation,
-            status: PolicyAckStatus::Error,
-            inert_rules: compiled.inert_rules,
-            error: Some(format!("ENFORCEMENT write failed: {error}")),
-        };
+        return error_ack(policy, compiled.inert_rules, format!("ENFORCEMENT write failed: {error}"));
     }
 
     // Build chunk #10: register this snapshot's name-rule patterns,
@@ -580,5 +631,91 @@ mod tests {
         assert_eq!(acks.len(), 1);
         assert_eq!(acks[0].status, ReleaseStatus::Released);
         assert!(state.containers.is_empty());
+    }
+
+    // #544: a partial POLICY-map write (a set_policy insert or remove that
+    // fails) must never be acked Applied, and must fail closed. These tests
+    // trip the #602 fault knobs on the exact ops apply_policy drives and assert
+    // each surfaces. Before the fix, apply_make_before_break was void and
+    // apply_policy acked Applied even when every insert had failed -- a new
+    // container's allow rules missing while its ack claimed success, the
+    // enforcement fail-open class.
+
+    #[test]
+    fn apply_policy_on_a_first_push_insert_failure_fails_closed_and_acks_error() {
+        let mut probe = MockProbe::new();
+        let lookup = lookup_with_one_container(51);
+        probe.seed_path(&lookup.cgroup_path_for_container(&container_id()).unwrap(), 51);
+        probe.faults.set_policy = Some("simulated EPERM on POLICY insert".to_string());
+
+        let mut state = DaemonState::new();
+        let name_rules = empty_name_rules();
+        // A default-Deny Block policy with one allow that will fail to insert.
+        let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("10.0.0.0/8", WireAction::Allow)] };
+
+        let ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
+
+        assert_eq!(ack.status, PolicyAckStatus::Error, "a failed POLICY insert must NOT be acked Applied (the #544 fail-open bug)");
+        let es = probe.get_enforcement(51).unwrap().expect("a brand-new container with a failed insert must still be enforced, never left observe-only");
+        assert_eq!(es.default_verdict, DefaultVerdict::Deny as u8, "the forced fail-closed default must be Deny");
+        assert!(!state.containers.contains_key(&container_id()), "a failed generation must not be recorded as applied state");
+    }
+
+    #[test]
+    fn apply_policy_on_an_update_insert_failure_leaves_prior_enforcement_and_acks_error() {
+        let mut probe = MockProbe::new();
+        let lookup = lookup_with_one_container(52);
+        probe.seed_path(&lookup.cgroup_path_for_container(&container_id()).unwrap(), 52);
+        let mut state = DaemonState::new();
+        let name_rules = empty_name_rules();
+
+        let first = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("10.0.0.0/8", WireAction::Allow)] };
+        assert_eq!(apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &first).status, PolicyAckStatus::Applied);
+        assert_eq!(probe.get_enforcement(52).unwrap().unwrap().generation, 1);
+
+        // Inserts now fail on the generation-2 update.
+        probe.faults.set_policy = Some("simulated EPERM on POLICY insert".to_string());
+        let second = Policy { container_id: container_id(), generation: 2, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("192.168.0.0/16", WireAction::Allow)] };
+        let ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &second);
+
+        assert_eq!(ack.status, PolicyAckStatus::Error, "a failed update must NOT be acked Applied");
+        assert_eq!(probe.get_enforcement(52).unwrap().unwrap().generation, 1, "a failed update must leave the prior generation's enforcement in place, never flip to the partial new one");
+    }
+
+    #[test]
+    fn apply_policy_on_an_update_remove_failure_also_surfaces_as_error() {
+        let mut probe = MockProbe::new();
+        let lookup = lookup_with_one_container(53);
+        probe.seed_path(&lookup.cgroup_path_for_container(&container_id()).unwrap(), 53);
+        let mut state = DaemonState::new();
+        let name_rules = empty_name_rules();
+
+        let first = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("10.0.0.0/24", WireAction::Allow)] };
+        apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &first);
+
+        // The generation-2 push drops the /24 (so it must be removed) but the
+        // remove fails: a stale entry may remain enforced, a partial write.
+        probe.faults.remove_policy_key = Some("simulated failure on POLICY remove".to_string());
+        let second = Policy { container_id: container_id(), generation: 2, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("192.168.0.0/16", WireAction::Allow)] };
+        let ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &second);
+
+        assert_eq!(ack.status, PolicyAckStatus::Error, "a failed make-before-break remove must surface as Error, not a silent Applied");
+        assert_eq!(probe.get_enforcement(53).unwrap().unwrap().generation, 1, "prior enforcement stays in place on a failed update");
+    }
+
+    #[test]
+    fn apply_policy_on_a_faulted_set_enforcement_acks_error() {
+        let mut probe = MockProbe::new();
+        let lookup = lookup_with_one_container(54);
+        probe.seed_path(&lookup.cgroup_path_for_container(&container_id()).unwrap(), 54);
+        probe.faults.set_enforcement = Some("simulated ENFORCEMENT write failure".to_string());
+        let mut state = DaemonState::new();
+        let name_rules = empty_name_rules();
+        let policy = Policy { container_id: container_id(), generation: 1, mode: WireMode::Block, default: WireDefault::Deny, rules: vec![cidr_rule("10.0.0.0/8", WireAction::Allow)] };
+
+        let ack = apply_policy(&mut probe, &mut state, &lookup, &name_rules, 0, &policy);
+        assert_eq!(ack.status, PolicyAckStatus::Error);
+        assert!(ack.error.unwrap().contains("ENFORCEMENT"), "the error must name the enforcement write");
+        assert!(!state.containers.contains_key(&container_id()));
     }
 }
