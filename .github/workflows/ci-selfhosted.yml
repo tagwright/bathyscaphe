@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Self-hosted-runner smoke-proof (tagwright CI runner rollout, task #554 / #571).
+#
+# This runs IN PARALLEL with ci.yml's ubuntu-latest build; it does not replace or
+# touch it. It targets the self-hosted tagwright runner whose labels are exactly
+# tagwright,dind,self-hosted, and whose job environment already points DOCKER_HOST
+# at its own isolated privileged dind over TLS.
+#
+# bathyscaphe is Rust/aya, not Go, and the self-hosted runner is LEAN: it ships
+# only node, no rustup/cargo/go on the host. So this is a TWO-job leg:
+#   - dind-reach: a host-level job (no container) that proves the runner picks up
+#     the job AND reaches its isolated dind over TLS, using the runner's own
+#     docker CLI. The docker CLI is not in the rust build image, which is why this
+#     is separate.
+#   - build: runs inside container: rust:1-bookworm (which provides cargo + a
+#     stable rustup), then does what bathyscaphe's own ci.yml does on top: install
+#     nightly + rust-src and the prebuilt bpf-linker, and cargo build --locked
+#     (the stable userspace crates plus the nightly no_std eBPF cross-compile via
+#     build.rs). No sudo: container jobs run as root.
+#
+# It deliberately skips cargo test: bathyscaphe's privileged eBPF live-integration
+# harness (load/attach/pin and observe/enforce/fail-safe against a real cgroup v2
+# host inside the privileged dind) is a separate deeper task, not this smoke leg.
+#
+# Reversible: delete this file to remove the self-hosted leg entirely.
+
+name: CI (self-hosted)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  BPF_LINKER_VERSION: "0.11.0"
+
+jobs:
+  dind-reach:
+    # Host-level (no container): the runner's own docker CLI talks to the isolated
+    # dind over DOCKER_HOST/TLS. A green docker info is the proof the job reached
+    # its scratch dind (there is no host socket).
+    runs-on: [self-hosted, tagwright, dind]
+    steps:
+      - name: Prove the isolated dind is reachable over TLS
+        run: |
+          docker version
+          docker info
+
+  build:
+    # rust:1-bookworm provides cargo + a stable rustup (the lean runner host has
+    # neither). Same labels so it lands on the same runner.
+    runs-on: [self-hosted, tagwright, dind]
+    container: rust:1-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src
+        run: rustup toolchain install nightly --component rust-src
+
+      - name: Install bpf-linker (prebuilt musl release, not `cargo install`)
+        # Container jobs run as root, so no sudo; zstd is not in the base image.
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq zstd curl
+          curl -sL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          tar --zstd -C /tmp -xf /tmp/bpf-linker.tar.zst
+          install -m 0755 /tmp/bpf-linker /usr/local/bin/bpf-linker
+
+      - name: Build
+        # One cargo build at the workspace root builds the stable userspace crates
+        # and, via bathyscaphe/build.rs (aya-build), cross-compiles the no_std eBPF
+        # crate on nightly through bpf-linker. See docs/BUILDING.md.
+        run: cargo build --locked
