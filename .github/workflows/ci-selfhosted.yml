@@ -7,21 +7,20 @@
 # tagwright,dind,self-hosted, and whose job environment already points DOCKER_HOST
 # at its own isolated privileged dind over TLS.
 #
-# bathyscaphe is Rust/aya, not Go, and the self-hosted runner is LEAN: it ships
-# only node, no rustup/cargo/go on the host. So this is a TWO-job leg:
-#   - dind-reach: a host-level job (no container) that proves the runner picks up
-#     the job AND reaches its isolated dind over TLS, using the runner's own
-#     docker CLI. The docker CLI is not in the rust build image, which is why this
-#     is separate.
-#   - build: runs inside container: rust:1-bookworm (which provides cargo + a
-#     stable rustup), then does what bathyscaphe's own ci.yml does on top: install
-#     nightly + rust-src and the prebuilt bpf-linker, and cargo build --locked
-#     (the stable userspace crates plus the nightly no_std eBPF cross-compile via
-#     build.rs). No sudo: container jobs run as root.
+# ARCHITECTURAL RULE for this runner: do NOT use `container:`. The runner's docker
+# is a REMOTE dind (a separate daemon over DOCKER_HOST/TLS, no shared filesystem),
+# and GitHub `container:` jobs bind-mount the runner's _work workspace into the job
+# container, which a remote dind cannot see, so a container job breaks early. Any
+# toolchain a leg needs is installed ON THE HOST instead, the way the Go legs use
+# actions/setup-go. bathyscaphe is Rust/aya, so it installs rust on the host via
+# setup-rust-toolchain (the setup-go equivalent) and adds nightly + rust-src for
+# the eBPF cross-compile.
 #
-# It deliberately skips cargo test: bathyscaphe's privileged eBPF live-integration
-# harness (load/attach/pin and observe/enforce/fail-safe against a real cgroup v2
-# host inside the privileged dind) is a separate deeper task, not this smoke leg.
+# It proves two things: that a real job is picked up by the runner AND can reach
+# its isolated dind (the docker step), and that bathyscaphe's two-toolchain build
+# (stable userspace + nightly no_std eBPF cross-compile via bpf-linker) succeeds on
+# the runner. It deliberately skips cargo test: the privileged eBPF live-
+# integration harness is a separate deeper task, not this smoke leg.
 #
 # Reversible: delete this file to remove the self-hosted leg entirely.
 
@@ -32,36 +31,47 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger, so the self-hosted smoke leg can be re-run from the Actions
+  # UI without a code push (there is no other way to re-run a self-hosted job
+  # that was cancelled or wedged). Matches the ballast pilot.
+  workflow_dispatch:
 
 env:
   BPF_LINKER_VERSION: "0.11.0"
 
 jobs:
-  dind-reach:
-    # Host-level (no container): the runner's own docker CLI talks to the isolated
-    # dind over DOCKER_HOST/TLS. A green docker info is the proof the job reached
-    # its scratch dind (there is no host socket).
+  build-selfhosted:
+    # Must match the runner's LABELS set exactly (tagwright,dind,self-hosted).
     runs-on: [self-hosted, tagwright, dind]
-    steps:
-      - name: Prove the isolated dind is reachable over TLS
-        run: |
-          docker version
-          docker info
-
-  build:
-    # rust:1-bookworm provides cargo + a stable rustup (the lean runner host has
-    # neither). Same labels so it lands on the same runner.
-    runs-on: [self-hosted, tagwright, dind]
-    container: rust:1-bookworm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install nightly + rust-src
+      - name: Prove the isolated dind is reachable over TLS
+        # docker info needs a live daemon connection, so a green step here proves
+        # the job reached its scratch dind over DOCKER_HOST/TLS (no host socket).
+        run: |
+          docker version
+          docker info
+
+      - name: Install Rust on the host (stable)
+        # setup-rust-toolchain installs rustup + the toolchain on the runner host
+        # (the lean runner ships only node), the Rust counterpart to setup-go.
+        # rustflags is set empty on purpose: the action otherwise injects
+        # RUSTFLAGS="-D warnings", which would fail the build on bathyscaphe's
+        # known, documented dead_code warnings (see ci.yml).
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ""
+
+      - name: Add nightly + rust-src
+        # aya-build cross-compiles the no_std eBPF crate on nightly from a
+        # userspace build.rs; rust-src is required for the -Z build-std it uses.
         run: rustup toolchain install nightly --component rust-src
 
       - name: Install bpf-linker (prebuilt musl release, not `cargo install`)
-        # Container jobs run as root, so no sudo; zstd is not in the base image.
+        # Jobs run as root on the host, so no sudo; zstd is not preinstalled.
         run: |
           apt-get update -qq
           apt-get install -y -qq zstd curl
