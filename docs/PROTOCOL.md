@@ -270,9 +270,9 @@ bathyscaphe unpins on its own and reports the container gone from
 ## 8. The security record (refinement R1) and the beacon/bilgeline mapping
 
 `security` (up, `kind: "security"`): a loud, first-class record for
-security-relevant conditions — an unenforceable name rule hit in
+security-relevant conditions (an unenforceable name rule hit in
 `mode: block`, sustained event drops, a policy violation, an in-kernel
-block — shaped after the OpenTelemetry log data model:
+block), shaped after the OpenTelemetry log data model:
 
 ```json
 {"kind":"security","timestamp":"2026-08-27T12:00:09.001271Z","severity_text":"ERROR","severity_number":17,"body":"denied connection to unresolved name rule target","attributes":{"container.id":"9f8e...","container.image":"whoami:latest","container.name":"suspicious-1","reason":"policy.unenforceable_name","rule_id":"r-gh-name"}}
@@ -281,7 +281,7 @@ block — shaped after the OpenTelemetry log data model:
 Fields: `timestamp` (RFC3339), `severity_text` (`INFO`\|`WARN`\|`ERROR`),
 `severity_number` (`u8`, OTel severity-number scale), `body` (the
 human-readable message), `attributes` (a flat map of OTel-style,
-dot-namespaced attribute keys — not a nested object — always including
+dot-namespaced attribute keys, not a nested object, always including
 `reason` and `container.id`/`container.name`/`container.image`, with
 `rule_id` and/or `domain` present only when relevant).
 
