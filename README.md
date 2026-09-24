@@ -1,5 +1,9 @@
 # bathyscaphe
 
+bathyscaphe is an eBPF egress probe for containers: it watches what each
+container sends out over the network and, when an operator opts a container in,
+blocks the connections that violate policy in the kernel before they are made.
+
 Status: functionally complete and packaged. The workspace builds on the
 documented two-toolchain image, the eBPF programs load/attach/pin, policy
 compilation and reconciliation work, the DNS-snoop FQDN layer is built
@@ -134,14 +138,14 @@ Four subcommands:
   and the R2 knobs (`--fail-closed-on-drops`, `--drop-threshold-per-sec`,
   `--drop-window-secs`, `--drop-action`).
 - `bathyscaphe unpin --all` -- the standalone break-glass. `--all` is
-  required on purpose; a bare `unpin` refuses to guess scope. See
+  required on purpose. A bare `unpin` refuses to guess scope. See
   docs/RECOVERY.md.
 - `bathyscaphe observe` -- a standalone, observe-only mode for manual
   verification: no airlock, no policy, no enforcement (the probe's
   enforcement map has no entry for anything `observe` attaches, which
   the hooks read as always-allow). With no `--container`, it attaches to
-  (and prints events from) every running container and picks up new ones;
-  with `--container <id-or-name>`, it attaches ONLY to the matching
+  (and prints events from) every running container and picks up new ones.
+  With `--container <id-or-name>`, it attaches ONLY to the matching
   container(s) -- the same flag that scopes what gets printed also scopes
   what gets a live kernel hook. On exit -- Ctrl-C (`SIGINT`), `docker stop`
   (`SIGTERM`), or `SIGHUP` -- it detaches everything it attached this
@@ -173,7 +177,7 @@ can ingest it with a stock filelog parser and no bespoke config.
   under today.
 - The Docker or Podman socket, mounted read-only, so bathyscaphe can
   enrich a cgroup id with the container's id/name/image. It only reads
-  the socket; it never starts, stops, or labels anything.
+  the socket, and never starts, stops, or labels anything.
 - A writable bpffs mounted at `--bpffs-root` (default
   `/sys/fs/bpf/bathyscaphe`), ideally the HOST's bpffs bind-mounted in
   rather than a fresh one minted per container, since that's what lets
@@ -195,15 +199,15 @@ case where the IP/CIDR floor itself is compromised:
   seeded either way, and a connection to the resulting IP is judged on
   IP/CIDR policy alone.
 - **Direct-IP egress bypasses name policy by definition.** A name rule
-  only ever inserts IPs it actually observed a trusted DNS answer for; a
+  only ever inserts IPs it actually observed a trusted DNS answer for. A
   connection straight to an IP address, with no DNS lookup involved,
   was never going to have a name rule apply to it in the first place.
-- **TCP-fallback DNS is not observed.** The snoop matches UDP only; a
+- **TCP-fallback DNS is not observed.** The snoop matches UDP only. A
   query or response that falls back to TCP:53 (oversized or truncated
   messages, or a resolver that prefers TCP outright) is invisible to
   both capture and correlation.
 - **IPv6 extension headers aren't walked.** The IPv6 parsing path
-  assumes UDP sits immediately after the fixed header; a query or
+  assumes UDP sits immediately after the fixed header. A query or
   response behind a Hop-by-Hop, Routing, or Fragment header is missed.
   DNS traffic essentially never uses these in practice, which is why
   this hasn't been prioritized, not because it's been ruled out as rare
@@ -216,7 +220,7 @@ case where the IP/CIDR floor itself is compromised:
   a different address, isn't automatically covered.
 - **A genuine cross-container DNS correlation collision fails safe, never
   cross-attributes.** The correlation key doesn't include a resolver
-  address component; when two containers' queries collide on it inside a
+  address component. When two containers' queries collide on it inside a
   short window, neither container's answer gets used for enforcement
   during the overlap, rather than risking one container's DNS answer
   seeding another's allow-map. The cost is a brief availability gap, not
