@@ -13,6 +13,8 @@ release. See docs/DEPLOY.md for the runtime privilege/mounts and the
 airlock integration topology, docs/BUILDING.md for the toolchain that
 compiles the eBPF side, and docs/TESTING.md for an honest ledger of
 what's been proven against a real kernel versus compile-only.
+docs/SECURITY.md states the enforcement contract, the trust model of
+the probe, and the DNS caveats.
 
 A bathyscaphe is a crewed deep-sea submersible: a small pressure-hulled
 vehicle that descends into the deep ocean under its own ballast, with
